@@ -61,21 +61,31 @@ class PIDGains:
 # ---------------------------------------------------------------------------
 # Encoder wiring: motor tag -> (phase_a_gpio, phase_b_gpio)
 # BCM pin numbering. Taken from the original encoders.py mapping.
+#
+# Physical positions on this build:
+#   M1 = upper-left    M4 = upper-right
+#   M2 = lower-left    M3 = lower-right
 # ---------------------------------------------------------------------------
 ENCODER_PINS: Dict[str, Tuple[int, int]] = {
-    "M1": (12, 13),   # SERVO_4, SERVO_5 headers
-    "M2": (26, 20),
-    "M3": (19, 16),
-    "M4": (10, 11),   # SERVO_2, SERVO_3 headers
+    "M1": (12, 13),   # upper-left   (SERVO_4, SERVO_5 headers)
+    "M2": (26, 20),   # lower-left
+    "M3": (19, 16),   # lower-right
+    "M4": (10, 11),   # upper-right  (SERVO_2, SERVO_3 headers)
 }
 
 # Which motor tags belong to which side, and the sign of their counts so that
-# "forward" produces positive counts on both sides. This matches Motor.py's
-# setMotorModel(duty1, duty2, duty3, duty4) grouping where duty1/duty2 drive
-# the left pair and duty3/duty4 drive the right pair.
+# "forward" produces positive counts on both sides.
 #
-# If your robot drives backwards under a "forward" command, flip the sign here
-# instead of touching any logic.
+# Grouping (matches the physical positions above and Motor.setMotorModel, whose
+# duty1/duty2 drive the left pair and duty3/duty4 the right pair):
+#   left  = M1 (upper-left)  + M2 (lower-left)
+#   right = M3 (lower-right) + M4 (upper-right)
+# Only the side grouping matters for skid-steer odometry (the two encoders on a
+# side are averaged), so the upper/lower order within a side is irrelevant.
+#
+# The SIGNS must be verified on hardware: drive forward and check each side's
+# count goes positive. If a side counts backwards, flip its two signs here -
+# no logic changes needed.
 @dataclass(frozen=True)
 class SideMapping:
     left: Tuple[str, ...] = ("M1", "M2")
@@ -103,9 +113,9 @@ MOTOR_CHANNELS = {
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class ControlConfig:
-    loop_hz: float = 50.0             # closed-loop update rate
-    telemetry_hz: float = 10.0        # rate telemetry is pushed to clients
-    command_timeout: float = 0.5      # s; stop motors if no drive cmd arrives
+    loop_hz: float = 20.0             # closed-loop update rate
+    telemetry_hz: float = 50.0        # rate telemetry is pushed to clients
+    command_timeout: float = 0.1      # s; stop motors if no drive cmd arrives
     max_linear: float = 0.6           # m/s, saturates drive commands
     max_angular: float = 4.0          # rad/s
 
