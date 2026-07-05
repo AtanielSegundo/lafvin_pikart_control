@@ -101,6 +101,8 @@ class Server:
         r.register('mecanum',        self._h_mecanum)
         r.register('car_rotate',     self._h_car_rotate)
         r.register('drive',          self._h_drive)
+        r.register('drive_distance', self._h_drive_distance)
+        r.register('turn',           self._h_turn)
         r.register('reset_odometry', self._h_reset_odometry)
         r.register('servo',          self._h_servo)
         r.register('led',            self._h_led)
@@ -406,6 +408,22 @@ class Server:
         v = c.num('linear', 0, 0.0)
         w = c.num('angular', 1, 0.0)
         self.drive.set_twist(v, w)
+
+    def _h_drive_distance(self, c: Command):
+        """Drive straight a set distance (m) and stop. Closed-loop on odometry."""
+        if self.Mode != 'one':
+            return
+        distance = c.num('distance', 0, 0.0)
+        speed = c.num('speed', 1, 0.2)
+        self.drive.drive_distance(distance, speed)
+
+    def _h_turn(self, c: Command):
+        """Turn in place by a set angle (deg) and stop."""
+        if self.Mode != 'one':
+            return
+        angle = c.num('angle', 0, 0.0)
+        speed = c.num('speed', 1, 1.0)
+        self.drive.turn_in_place(angle, speed)
 
     def _h_reset_odometry(self, c: Command):
         self.drive.reset_odometry()

@@ -156,6 +156,15 @@ so it's defense-in-depth). Integral windup is handled two ways:
   `ki·integral` (in duty units, not the raw accumulator), reflected back into
   the stored state as a backstop.
 
+**High-level moves** (`drive_distance`, `turn_in_place`). These are motion
+*goals* the control loop services each tick, closed on the odometry: it drives
+the target twist, tapers speed near the end to limit overshoot (a heading term
+holds the line straight), and stops itself when the measured travel reaches the
+target. In the simulated plant, `drive_distance(3.0)` stops within ~0.5 cm.
+> Real-world accuracy depends on **`counts_per_rev` calibration** and, for
+> skid-steer, **wheel slip** (worse in turns). Expect good straight-line
+> accuracy once calibrated; treat turn angles as approximate.
+
 Engagement: the controller is **released** by default (odometry keeps running,
 motors untouched so raw `CMD_MOTOR` duty still works). A velocity command
 **engages** it (PID takes over). A command timeout (`command_timeout`) forces a
@@ -175,6 +184,8 @@ Both encodings are accepted on the same socket; replies/telemetry are JSON.
 | JSON | Legacy text | Effect |
 |------|-------------|--------|
 | `{"type":"drive","linear":0.3,"angular":0.5}` | — | closed-loop velocity (m/s, rad/s) |
+| `{"type":"drive_distance","distance":3.0,"speed":0.3}` | — | drive straight N m (odometry-closed) and stop |
+| `{"type":"turn","angle":90,"speed":1.0}` | — | turn in place N° (odometry-closed) and stop |
 | `{"type":"motor","duty":[f,b,f,b]}` | `CMD_MOTOR#f#b#f#b` | raw skid duty (bypasses PID) |
 | `{"type":"mecanum",...}` | `CMD_M_MOTOR#a#m#a#m` | legacy mecanum mix |
 | `{"type":"servo","channel":"0","angle":90}` | `CMD_SERVO#0#90` | pan/tilt |

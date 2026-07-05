@@ -215,6 +215,44 @@ class TestDriveControllerClosedLoop(unittest.TestCase):
         self.assertFalse(tel["engaged"])
         self.assertEqual(tel["duty"], {"left": 0, "right": 0})
 
+    def _run_until_goal_done(self, ctrl, dt, max_steps=6000):
+        tel = {}
+        for _ in range(max_steps):
+            tel = ctrl.step(dt)
+            if not tel["goal_active"]:
+                return tel
+        return tel
+
+    def test_drive_distance_reaches_target(self):
+        ctrl = self._make()
+        dt = 1.0 / CONFIG.control.loop_hz
+        ctrl.drive_distance(3.0, speed=0.3)
+        tel = self._run_until_goal_done(ctrl, dt)
+        self.assertFalse(tel["goal_active"])
+        # Stopped within a couple cm of 3 m, and stayed straight.
+        self.assertAlmostEqual(tel["pose"]["x"], 3.0, delta=0.03)
+        self.assertAlmostEqual(tel["pose"]["y"], 0.0, delta=0.03)
+        # A few steps later it is holding still.
+        for _ in range(20):
+            tel = ctrl.step(dt)
+        self.assertEqual(tel["duty"], {"left": 0, "right": 0})
+
+    def test_drive_distance_reverse(self):
+        ctrl = self._make()
+        dt = 1.0 / CONFIG.control.loop_hz
+        ctrl.drive_distance(-1.0, speed=0.25)
+        tel = self._run_until_goal_done(ctrl, dt)
+        self.assertAlmostEqual(tel["pose"]["x"], -1.0, delta=0.03)
+
+    def test_turn_in_place_reaches_angle(self):
+        ctrl = self._make()
+        dt = 1.0 / CONFIG.control.loop_hz
+        ctrl.turn_in_place(90.0, ang_speed=1.2)
+        tel = self._run_until_goal_done(ctrl, dt)
+        self.assertFalse(tel["goal_active"])
+        self.assertAlmostEqual(tel["pose"]["theta"], math.pi / 2, delta=0.05)
+        self.assertAlmostEqual(tel["pose"]["x"], 0.0, delta=0.03)
+
 
 class TestProtocol(unittest.TestCase):
     def test_parse_legacy(self):

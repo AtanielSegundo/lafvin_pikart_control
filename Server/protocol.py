@@ -31,6 +31,8 @@ ALIASES: Dict[str, str] = {
     "CMD_M_MOTOR": "mecanum", "mecanum": "mecanum", "m_motor": "mecanum",
     "CMD_CAR_ROTATE": "car_rotate", "car_rotate": "car_rotate",
     "drive": "drive",                       # closed-loop velocity (new)
+    "drive_distance": "drive_distance",     # closed-loop distance (new)
+    "turn": "turn",                         # closed-loop in-place turn (new)
     "reset_odometry": "reset_odometry",     # (new)
     # peripherals
     "CMD_SERVO": "servo", "servo": "servo",
