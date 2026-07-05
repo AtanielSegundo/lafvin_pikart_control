@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Car Control</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background: #1a1a2e; color: #eee;
+  touch-action: manipulation;
+  overflow-x: hidden;
+  -webkit-user-select: none; user-select: none;
+}
+
+.video-container {
+  width: 100%; max-width: 500px; margin: 0 auto;
+  aspect-ratio: 4/3; background: #000; position: relative;
+  border-radius: 8px; overflow: hidden;
+}
+.video-container img {
+  width: 100%; height: 100%; object-fit: contain;
+}
+.video-overlay {
+  position: absolute; top: 8px; right: 8px;
+  background: rgba(0,0,0,0.6); padding: 4px 8px;
+  border-radius: 4px; font-size: 12px;
+}
+
+.section { padding: 12px; max-width: 500px; margin: 0 auto; }
+
+/* Mode selector */
+.mode-bar {
+  display: flex; gap: 6px; justify-content: center;
+  flex-wrap: wrap; padding: 8px 12px;
+}
+.mode-btn {
+  flex: 1; min-width: 70px; padding: 10px 4px;
+  border: 2px solid #444; border-radius: 8px;
+  background: #16213e; color: #aaa;
+  font-size: 12px; font-weight: 600; text-align: center;
+  cursor: pointer; transition: all 0.2s;
+}
+.mode-btn.active {
+  border-color: #4cc9f0; color: #4cc9f0;
+  background: #1a2a4a;
+}
+
+/* Joystick */
+.joystick-area {
+  display: flex; justify-content: space-between;
+  align-items: center; padding: 8px 12px; gap: 12px;
+}
+.joystick-wrapper {
+  position: relative; touch-action: none;
+}
+canvas.joystick {
+  border-radius: 50%; background: #16213e;
+  border: 2px solid #333;
+}
+
+/* Speed slider */
+.slider-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 4px 12px;
+}
+.slider-row label { font-size: 13px; color: #888; min-width: 60px; }
+.slider-row input[type=range] { flex: 1; accent-color: #4cc9f0; }
+.slider-row .val { font-size: 13px; color: #4cc9f0; min-width: 40px; text-align: right; }
+
+/* Quick buttons */
+.quick-btns {
+  display: flex; gap: 6px; justify-content: center;
+  padding: 4px 12px; flex-wrap: wrap;
+}
+.qbtn {
+  padding: 10px 14px; border: 1px solid #444;
+  border-radius: 6px; background: #16213e; color: #ccc;
+  font-size: 13px; cursor: pointer; min-width: 44px; text-align: center;
+}
+.qbtn:active, .qbtn.pressed { background: #4cc9f0; color: #000; }
+.qbtn.danger { border-color: #e63946; color: #e63946; }
+.qbtn.danger:active { background: #e63946; color: #fff; }
+
+/* Servo sliders */
+.servo-section {
+  display: flex; gap: 10px; padding: 4px 12px;
+}
+.servo-section .slider-row { flex: 1; }
+
+/* Extras */
+.extras {
+  padding: 8px 12px;
+}
+.extras summary {
+  cursor: pointer; color: #888; font-size: 13px; padding: 6px 0;
+}
+.extras-inner {
+  display: flex; gap: 10px; align-items: center;
+  padding: 8px 0; flex-wrap: wrap;
+}
+.extras-inner label { font-size: 13px; color: #888; }
+.battery { font-size: 14px; color: #4cc9f0; }
+</style>
+</head>
+<body>
+
+<!-- Camera feed -->
+<div class="video-container">
+  <img id="video" src="/video" alt="Camera">
+  <div class="video-overlay"><span class="battery" id="bat">--V</span></div>
+</div>
+
+<!-- Mode selector -->
+<div class="mode-bar">
+  <div class="mode-btn active" data-mode="one" onclick="setMode('one')">Manual</div>
+  <div class="mode-btn" data-mode="two" onclick="setMode('two')">Light</div>
+  <div class="mode-btn" data-mode="three" onclick="setMode('three')">Ultrasonic</div>
+  <div class="mode-btn" data-mode="four" onclick="setMode('four')">Line Track</div>
+</div>
+
+<!-- Joystick area -->
+<div class="joystick-area" id="manualControls">
+  <div class="joystick-wrapper">
+    <canvas class="joystick" id="moveJoy" width="160" height="160"></canvas>
+  </div>
+  <div style="display:flex;flex-direction:column;gap:6px;align-items:center;">
+    <div class="qbtn" id="btnRotCW" style="font-size:20px;">&#8635;</div>
+    <div style="font-size:11px;color:#666;">STOP</div>
+    <div class="qbtn danger" id="btnStop" style="font-size:16px;padding:12px 18px;">&#9632;</div>
+    <div style="font-size:11px;color:#666;">ROT</div>
+    <div class="qbtn" id="btnRotCCW" style="font-size:20px;">&#8634;</div>
+  </div>
+  <div class="joystick-wrapper">
+    <canvas class="joystick" id="rotJoy" width="160" height="160"></canvas>
+  </div>
+</div>
+
+<!-- Speed -->
+<div class="slider-row">
+  <label>Speed</label>
+  <input type="range" id="speedSlider" min="500" max="4095" value="2000" step="100">
+  <span class="val" id="speedVal">2000</span>
+</div>
+
+<!-- Servo controls -->
+<div class="servo-section">
+  <div class="slider-row">
+    <label>Pan</label>
+    <input type="range" id="panSlider" min="50" max="130" value="90" step="1">
+    <span class="val" id="panVal">90</span>
+  </div>
+  <div class="slider-row">
+    <label>Tilt</label>
+    <input type="range" id="tiltSlider" min="50" max="150" value="90" step="1">
+    <span class="val" id="tiltVal">90</span>
+  </div>
+</div>
+
+<!-- Extras -->
+<details class="extras">
+  <summary>LED &amp; Buzzer</summary>
+  <div class="extras-inner">
+    <label>LED Color:</label>
+    <input type="color" id="ledColor" value="#ff0000">
+    <div class="qbtn" onclick="sendLedColor()">Set</div>
+    <div class="qbtn" onclick="sendLedOff()">Off</div>
+    <label>Mode:</label>
+    <select id="ledMode" onchange="sendLedMode(this.value)" style="background:#16213e;color:#ccc;border:1px solid #444;padding:4px;border-radius:4px;">
+      <option value="0">Off</option>
+      <option value="2">Color Wipe</option>
+      <option value="3">Theater Chase</option>
+      <option value="4">Rainbow</option>
+      <option value="5">Rainbow Cycle</option>
+    </select>
+    <div class="qbtn" id="btnBuzz" onclick="toggleBuzzer()">Buzz</div>
+  </div>
+</details>
+
+<script>
+// --- WebSocket ---
+let ws;
+let wsReady = false;
+function connectWs() {
+  ws = new WebSocket('ws://' + location.host + '/ws');
+  ws.onopen = () => { wsReady = true; console.log('WS connected'); };
+  ws.onclose = () => { wsReady = false; setTimeout(connectWs, 1000); };
+  ws.onerror = () => { ws.close(); };
+  ws.onmessage = (e) => {
+    // Handle status messages from server
+    const parts = e.data.trim().split('#');
+    if (parts[0] === 'CMD_POWER' && parts[1]) {
+      document.getElementById('bat').textContent = parts[1] + 'V';
+    }
+  };
+}
+connectWs();
+
+function send(cmd) {
+  if (wsReady) ws.send(cmd + '\n');
+}
+
+// --- Mode ---
+let currentMode = 'one';
+function setMode(mode) {
+  currentMode = mode;
+  send('CMD_MODE#' + mode);
+  document.querySelectorAll('.mode-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.mode === mode);
+  });
+  document.getElementById('manualControls').style.opacity = mode === 'one' ? '1' : '0.3';
+}
+
+// --- Speed ---
+const speedSlider = document.getElementById('speedSlider');
+const speedVal = document.getElementById('speedVal');
+speedSlider.oninput = () => { speedVal.textContent = speedSlider.value; };
+
+// --- Joystick ---
+class Joystick {
+  constructor(canvasId, onMove, onRelease) {
+    this.canvas = document.getElementById(canvasId);
+    this.ctx = this.canvas.getContext('2d');
+    this.cx = this.canvas.width / 2;
+    this.cy = this.canvas.height / 2;
+    this.radius = this.cx - 10;
+    this.knobRadius = 22;
+    this.kx = this.cx;
+    this.ky = this.cy;
+    this.active = false;
+    this.onMove = onMove;
+    this.onRelease = onRelease;
+    this.touchId = null;
+
+    this.canvas.addEventListener('touchstart', e => this.tstart(e), {passive: false});
+    this.canvas.addEventListener('touchmove', e => this.tmove(e), {passive: false});
+    this.canvas.addEventListener('touchend', e => this.tend(e), {passive: false});
+    this.canvas.addEventListener('touchcancel', e => this.tend(e), {passive: false});
+    // Mouse fallback
+    this.canvas.addEventListener('mousedown', e => this.mdown(e));
+    window.addEventListener('mousemove', e => { if (this.active && this.touchId === 'mouse') this.mmove(e); });
+    window.addEventListener('mouseup', e => { if (this.active && this.touchId === 'mouse') this.mup(e); });
+
+    this.draw();
+  }
+
+  getPos(touch) {
+    const r = this.canvas.getBoundingClientRect();
+    return { x: touch.clientX - r.left, y: touch.clientY - r.top };
+  }
+
+  clamp(x, y) {
+    const dx = x - this.cx, dy = y - this.cy;
+    const dist = Math.sqrt(dx*dx + dy*dy);
+    if (dist > this.radius) {
+      const s = this.radius / dist;
+      return { x: this.cx + dx * s, y: this.cy + dy * s };
+    }
+    return { x, y };
+  }
+
+  tstart(e) {
+    e.preventDefault();
+    if (this.active) return;
+    const t = e.changedTouches[0];
+    this.touchId = t.identifier;
+    this.active = true;
+    const p = this.getPos(t);
+    const c = this.clamp(p.x, p.y);
+    this.kx = c.x; this.ky = c.y;
+    this.update();
+  }
+  tmove(e) {
+    e.preventDefault();
+    for (const t of e.changedTouches) {
+      if (t.identifier === this.touchId) {
+        const p = this.getPos(t);
+        const c = this.clamp(p.x, p.y);
+        this.kx = c.x; this.ky = c.y;
+        this.update();
+      }
+    }
+  }
+  tend(e) {
+    e.preventDefault();
+    for (const t of e.changedTouches) {
+      if (t.identifier === this.touchId) {
+        this.active = false;
+        this.touchId = null;
+        this.kx = this.cx; this.ky = this.cy;
+        this.draw();
+        this.onRelease();
+      }
+    }
+  }
+  mdown(e) {
+    e.preventDefault();
+    this.active = true;
+    this.touchId = 'mouse';
+    const p = this.getPos(e);
+    const c = this.clamp(p.x, p.y);
+    this.kx = c.x; this.ky = c.y;
+    this.update();
+  }
+  mmove(e) {
+    const p = this.getPos(e);
+    const c = this.clamp(p.x, p.y);
+    this.kx = c.x; this.ky = c.y;
+    this.update();
+  }
+  mup(e) {
+    this.active = false;
+    this.touchId = null;
+    this.kx = this.cx; this.ky = this.cy;
+    this.draw();
+    this.onRelease();
+  }
+
+  update() {
+    this.draw();
+    const dx = this.kx - this.cx;
+    const dy = -(this.ky - this.cy); // flip Y so up is positive
+    const dist = Math.sqrt(dx*dx + dy*dy);
+    const norm = dist / this.radius; // 0..1
+    const angle = Math.atan2(dx, dy) * 180 / Math.PI; // 0=up, 90=right
+    this.onMove(angle, norm);
+  }
+
+  draw() {
+    const ctx = this.ctx;
+    const w = this.canvas.width, h = this.canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    // Outer ring
+    ctx.beginPath();
+    ctx.arc(this.cx, this.cy, this.radius, 0, Math.PI*2);
+    ctx.strokeStyle = '#333';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    // Cross
+    ctx.beginPath();
+    ctx.moveTo(this.cx, this.cy - this.radius); ctx.lineTo(this.cx, this.cy + this.radius);
+    ctx.moveTo(this.cx - this.radius, this.cy); ctx.lineTo(this.cx + this.radius, this.cy);
+    ctx.strokeStyle = '#222';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    // Knob
+    ctx.beginPath();
+    ctx.arc(this.kx, this.ky, this.knobRadius, 0, Math.PI*2);
+    ctx.fillStyle = this.active ? '#4cc9f0' : '#555';
+    ctx.fill();
+    ctx.strokeStyle = this.active ? '#7ce5ff' : '#666';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+}
+
+// Movement command throttle
+let moveAngle = 0, moveSpeed = 0, rotAngle = 0, rotSpeed = 0;
+let moveActive = false, rotActive = false;
+
+const moveJoy = new Joystick('moveJoy',
+  (angle, norm) => {
+    moveAngle = Math.round(angle);
+    moveSpeed = Math.round(norm * parseInt(speedSlider.value));
+    moveActive = true;
+  },
+  () => { moveActive = false; moveSpeed = 0; sendMotor(); }
+);
+
+const rotJoy = new Joystick('rotJoy',
+  (angle, norm) => {
+    rotAngle = Math.round(angle);
+    rotSpeed = Math.round(norm * parseInt(speedSlider.value));
+    rotActive = true;
+  },
+  () => { rotActive = false; rotSpeed = 0; sendMotor(); }
+);
+
+function sendMotor() {
+  if (currentMode !== 'one') return;
+  if (moveSpeed === 0 && rotSpeed === 0) {
+    send('CMD_MOTOR#0#0#0#0');
+  } else {
+    send('CMD_M_MOTOR#' + moveAngle + '#' + moveSpeed + '#' + rotAngle + '#' + rotSpeed);
+  }
+}
+
+// Send at ~15 Hz
+setInterval(() => {
+  if ((moveActive || rotActive) && currentMode === 'one') {
+    sendMotor();
+  }
+}, 66);
+
+// --- Rotation buttons ---
+function holdBtn(id, onDown, onUp) {
+  const el = document.getElementById(id);
+  const start = (e) => { e.preventDefault(); el.classList.add('pressed'); onDown(); };
+  const end = (e) => { e.preventDefault(); el.classList.remove('pressed'); onUp(); };
+  el.addEventListener('touchstart', start, {passive:false});
+  el.addEventListener('touchend', end, {passive:false});
+  el.addEventListener('touchcancel', end, {passive:false});
+  el.addEventListener('mousedown', start);
+  el.addEventListener('mouseup', end);
+  el.addEventListener('mouseleave', end);
+}
+
+const ROT_SPEED = 2000;
+holdBtn('btnRotCW',
+  () => send('CMD_MOTOR#' + (-ROT_SPEED) + '#' + (-ROT_SPEED) + '#' + ROT_SPEED + '#' + ROT_SPEED),
+  () => send('CMD_MOTOR#0#0#0#0')
+);
+holdBtn('btnRotCCW',
+  () => send('CMD_MOTOR#' + ROT_SPEED + '#' + ROT_SPEED + '#' + (-ROT_SPEED) + '#' + (-ROT_SPEED)),
+  () => send('CMD_MOTOR#0#0#0#0')
+);
+document.getElementById('btnStop').addEventListener('click', () => {
+  send('CMD_MOTOR#0#0#0#0');
+});
+
+// --- Servo ---
+const panSlider = document.getElementById('panSlider');
+const tiltSlider = document.getElementById('tiltSlider');
+panSlider.oninput = () => {
+  document.getElementById('panVal').textContent = panSlider.value;
+  send('CMD_SERVO#0#' + panSlider.value);
+};
+tiltSlider.oninput = () => {
+  document.getElementById('tiltVal').textContent = tiltSlider.value;
+  send('CMD_SERVO#1#' + tiltSlider.value);
+};
+
+// --- LED ---
+function sendLedColor() {
+  const hex = document.getElementById('ledColor').value;
+  const r = parseInt(hex.substr(1,2),16);
+  const g = parseInt(hex.substr(3,2),16);
+  const b = parseInt(hex.substr(5,2),16);
+  send('CMD_LED#255#' + r + '#' + g + '#' + b);
+}
+function sendLedOff() {
+  send('CMD_LED#255#0#0#0');
+}
+function sendLedMode(mode) {
+  send('CMD_LED_MOD#' + mode);
+}
+
+// --- Buzzer ---
+let buzzerOn = false;
+function toggleBuzzer() {
+  buzzerOn = !buzzerOn;
+  send('CMD_BUZZER#' + (buzzerOn ? '1' : '0'));
+  document.getElementById('btnBuzz').classList.toggle('pressed', buzzerOn);
+}
+
+// --- Battery poll ---
+setInterval(() => { send('CMD_POWER'); }, 5000);
+
+// --- Keyboard controls (desktop) ---
+const keyMap = {
+  'w': () => send('CMD_MOTOR#2000#2000#2000#2000'),
+  's': () => send('CMD_MOTOR#-2000#-2000#-2000#-2000'),
+  'a': () => send('CMD_MOTOR#-2000#2000#2000#-2000'),
+  'd': () => send('CMD_MOTOR#2000#-2000#-2000#2000'),
+  'q': () => send('CMD_MOTOR#2000#2000#-2000#-2000'),
+  'e': () => send('CMD_MOTOR#-2000#-2000#2000#2000'),
+};
+const keysDown = new Set();
+document.addEventListener('keydown', (e) => {
+  if (currentMode !== 'one' || keysDown.has(e.key)) return;
+  keysDown.add(e.key);
+  if (keyMap[e.key]) keyMap[e.key]();
+});
+document.addEventListener('keyup', (e) => {
+  keysDown.delete(e.key);
+  if (keyMap[e.key] && keysDown.size === 0) send('CMD_MOTOR#0#0#0#0');
+});
+</script>
+</body>
+</html>
