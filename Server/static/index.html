@@ -144,6 +144,26 @@ canvas.joystick {
   <span class="val" id="speedVal">2000</span>
 </div>
 
+<!-- Drive mode + odometry telemetry -->
+<div class="slider-row" style="justify-content:space-between;">
+  <label style="min-width:auto;">
+    <input type="checkbox" id="pidToggle"> Closed-loop (PID)
+  </label>
+  <div class="qbtn" onclick="send(JSON.stringify({type:'reset_odometry'}))">Reset odom</div>
+</div>
+<div class="section" style="padding:4px 12px;">
+  <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;
+              font-size:12px;background:#16213e;border:1px solid #333;
+              border-radius:6px;padding:8px;">
+    <div>x: <span id="odoX" style="color:#4cc9f0;">0.000</span> m</div>
+    <div>y: <span id="odoY" style="color:#4cc9f0;">0.000</span> m</div>
+    <div>θ: <span id="odoT" style="color:#4cc9f0;">0.0°</span></div>
+    <div>vL: <span id="odoVL" style="color:#4cc9f0;">0.00</span></div>
+    <div>vR: <span id="odoVR" style="color:#4cc9f0;">0.00</span></div>
+    <div>ctl: <span id="odoEng" style="color:#4cc9f0;">raw</span></div>
+  </div>
+</div>
+
 <!-- Servo controls -->
 <div class="servo-section">
   <div class="slider-row">
@@ -188,14 +208,40 @@ function connectWs() {
   ws.onclose = () => { wsReady = false; setTimeout(connectWs, 1000); };
   ws.onerror = () => { ws.close(); };
   ws.onmessage = (e) => {
-    // Handle status messages from server
-    const parts = e.data.trim().split('#');
-    if (parts[0] === 'CMD_POWER' && parts[1]) {
-      document.getElementById('bat').textContent = parts[1] + 'V';
+    const raw = e.data.trim();
+    if (raw.startsWith('{')) {
+      handleTelemetry(raw);
+    } else {
+      // Legacy text messages (e.g. CMD_POWER#7.9) for backward compatibility.
+      const parts = raw.split('#');
+      if (parts[0] === 'CMD_POWER' && parts[1]) {
+        document.getElementById('bat').textContent = parts[1] + 'V';
+      }
     }
   };
 }
 connectWs();
+
+// --- Telemetry (data receiving over WebSocket) ---
+function handleTelemetry(raw) {
+  let msg;
+  try { msg = JSON.parse(raw); } catch (_) { return; }
+  if (msg.type !== 'telemetry') return;
+
+  if (msg.battery != null) {
+    document.getElementById('bat').textContent = msg.battery + 'V';
+  }
+  const d = msg.drive || {};
+  const p = d.pose || {};
+  const ws_ = d.wheel_speed || {};
+  const setTxt = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+  setTxt('odoX', (p.x ?? 0).toFixed(3));
+  setTxt('odoY', (p.y ?? 0).toFixed(3));
+  setTxt('odoT', (p.theta_deg ?? 0).toFixed(1) + '°');
+  setTxt('odoVL', (ws_.left ?? 0).toFixed(2));
+  setTxt('odoVR', (ws_.right ?? 0).toFixed(2));
+  setTxt('odoEng', d.engaged ? 'PID' : 'raw');
+}
 
 function send(cmd) {
   if (wsReady) ws.send(cmd + '\n');
@@ -355,34 +401,52 @@ class Joystick {
   }
 }
 
-// Movement command throttle
-let moveAngle = 0, moveSpeed = 0, rotAngle = 0, rotSpeed = 0;
+// Robot velocity limits (mirror ControlConfig in config.py).
+const MAX_LINEAR = 0.6;    // m/s
+const MAX_ANGULAR = 4.0;   // rad/s
+
+// Movement command throttle. Store angle + magnitude (0..1) per joystick.
+let moveAngle = 0, moveNorm = 0, rotAngle = 0, rotNorm = 0;
 let moveActive = false, rotActive = false;
 
+const pidToggle = document.getElementById('pidToggle');
+const pidOn = () => pidToggle.checked;
+
 const moveJoy = new Joystick('moveJoy',
-  (angle, norm) => {
-    moveAngle = Math.round(angle);
-    moveSpeed = Math.round(norm * parseInt(speedSlider.value));
-    moveActive = true;
-  },
-  () => { moveActive = false; moveSpeed = 0; sendMotor(); }
+  (angle, norm) => { moveAngle = angle; moveNorm = norm; moveActive = true; },
+  () => { moveActive = false; moveNorm = 0; sendMotor(); }
 );
 
 const rotJoy = new Joystick('rotJoy',
-  (angle, norm) => {
-    rotAngle = Math.round(angle);
-    rotSpeed = Math.round(norm * parseInt(speedSlider.value));
-    rotActive = true;
-  },
-  () => { rotActive = false; rotSpeed = 0; sendMotor(); }
+  (angle, norm) => { rotAngle = angle; rotNorm = norm; rotActive = true; },
+  () => { rotActive = false; rotNorm = 0; sendMotor(); }
 );
 
 function sendMotor() {
   if (currentMode !== 'one') return;
+  const scale = parseInt(speedSlider.value) / 4095;
+
+  if (pidOn()) {
+    // Closed-loop: joystick -> body twist (linear, angular).
+    const ma = moveAngle * Math.PI / 180, ra = rotAngle * Math.PI / 180;
+    const forward = moveNorm * Math.cos(ma);          // up = forward
+    const steer   = moveNorm * Math.sin(ma);          // right = +x
+    const rotSteer = rotNorm * Math.sin(ra);          // dedicated turn joystick
+    const linear  = forward * MAX_LINEAR * scale;
+    const angular = -(steer + rotSteer) * MAX_ANGULAR * scale;  // +ccw
+    send(JSON.stringify({ type: 'drive', linear: +linear.toFixed(3),
+                          angular: +angular.toFixed(3) }));
+    return;
+  }
+
+  // Legacy open-loop mecanum mix.
+  const moveSpeed = Math.round(moveNorm * parseInt(speedSlider.value));
+  const rotSpeed = Math.round(rotNorm * parseInt(speedSlider.value));
   if (moveSpeed === 0 && rotSpeed === 0) {
     send('CMD_MOTOR#0#0#0#0');
   } else {
-    send('CMD_M_MOTOR#' + moveAngle + '#' + moveSpeed + '#' + rotAngle + '#' + rotSpeed);
+    send('CMD_M_MOTOR#' + Math.round(moveAngle) + '#' + moveSpeed + '#' +
+         Math.round(rotAngle) + '#' + rotSpeed);
   }
 }
 

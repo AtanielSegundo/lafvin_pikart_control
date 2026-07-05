@@ -28,6 +28,11 @@ from threading import Thread
 from Command import COMMAND as cmd
 import RPi.GPIO as GPIO
 
+from config import CONFIG
+from protocol import CommandRouter, Command
+from encoders import WheelEncoders
+from drive_controller import DriveController
+
 
 class StreamingOutput(io.BufferedIOBase):
     def __init__(self):
@@ -72,6 +77,39 @@ class Server:
 
         # --- conexão de comandos ativa (usada por send()) ---
         self.connection1      = None
+
+        # --- closed-loop drivetrain (encoders + odometry + PID) ---
+        self.encoders  = WheelEncoders(CONFIG.sides)
+        self.drive     = DriveController(self.PWM, self.encoders, CONFIG)
+        self._rotate_thread = None
+        try:
+            self.drive.start()   # begins encoder listening + control loop
+        except Exception as e:
+            print(f"DriveController failed to start: {e}")
+
+        # --- extensible command routing ---
+        self.router = CommandRouter()
+        self._build_router()
+
+    # ------------------------------------------------------------------
+    # Command handler registration (replaces the old if/elif chain).
+    # Adding a command = register one handler here.
+    # ------------------------------------------------------------------
+    def _build_router(self):
+        r = self.router
+        r.register('motor',          self._h_motor)
+        r.register('mecanum',        self._h_mecanum)
+        r.register('car_rotate',     self._h_car_rotate)
+        r.register('drive',          self._h_drive)
+        r.register('reset_odometry', self._h_reset_odometry)
+        r.register('servo',          self._h_servo)
+        r.register('led',            self._h_led)
+        r.register('led_mode',       self._h_led_mode)
+        r.register('buzzer',         self._h_buzzer)
+        r.register('sonic',          self._h_sonic)
+        r.register('light',          self._h_light)
+        r.register('power',          self._h_power)
+        r.register('mode',           self._h_mode)
 
     def get_interface_ip(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -251,6 +289,9 @@ class Server:
                 print("Client disconnected, waiting for new connection ...")
 
     def stopMode(self):
+        # Hand motor control back to the loop-free state and stop any rotation.
+        self._stop_rotation()
+        self.drive.release()
         try:
             stop_thread(self.infraredRun)
             self.PWM.setMotorModel(0, 0, 0, 0)
@@ -276,171 +317,220 @@ class Server:
         self.send('CMD_MODE' + '#2' + '#' + '000' + '\n')
 
     def dispatch_command(self, oneCmd):
-        """Handle a single command string. Called by readdata() and web handler."""
+        """Handle a single command (legacy text or JSON), via the router.
+
+        Called by readdata() (TCP) and the web/WebSocket handler.
+        """
         with self.cmd_lock:
-            data = oneCmd.split("#")
-            if data is None:
-                return
-            elif cmd.CMD_MODE in data:
-                if data[1] == 'one' or data[1] == "0":
-                    self.stopMode()
-                    self.Mode = 'one'
-                
-                elif data[1] == 'two' or data[1] == "1":
-                    self.stopMode()
-                    self.Mode = 'two'
-                    self.lightRun = Thread(target=self.light.run)
-                    self.lightRun.start()
-                    self.Light = True
-                    self.lightTimer = threading.Timer(0.3, self.sendLight)
-                    self.lightTimer.start()
-                
-                elif data[1] == 'three' or data[1] == "3":
-                    self.stopMode()
-                    self.Mode = 'three'
-                    self.ultrasonicRun = threading.Thread(target=self.ultrasonic.run)
-                    self.ultrasonicRun.start()
-                    self.sonic = False
-                    self.ultrasonicTimer = threading.Timer(5, self.sendUltrasonic)
-                    self.ultrasonicTimer.start()
-                
-                elif data[1] == 'four' or data[1] == "2":
-                    self.stopMode()
-                    self.Mode = 'four'
-                    self.infraredRun = threading.Thread(target=self.infrared.run)
-                    self.infraredRun.start()
-                    self.Line = True
-                    self.lineTimer = threading.Timer(0.4, self.sendLine)
-                    self.lineTimer.start()
+            try:
+                self.router.dispatch(oneCmd)
+            except Exception as e:
+                print(f"dispatch error for {oneCmd!r}: {e}")
 
-            elif (cmd.CMD_MOTOR in data) and self.Mode == 'one':
-                try:
-                    data1=int(data[1])
-                    data2=int(data[2])
-                    data3=int(data[3])
-                    data4=int(data[4])
-                    self.PWM.setMotorModel(data1, data2, data3, data4)
-                except:
-                    pass
-            elif (cmd.CMD_M_MOTOR in data) and self.Mode == 'one':
-                try:
-                    data1 = int(data[1])
-                    data2 = int(data[2])
-                    data3 = int(data[3])
-                    data4 = int(data[4])
+    def get_telemetry(self):
+        """Snapshot of everything a client may want to display."""
+        try:
+            battery = round(self.adc.recvADC(2) * 5, 2)
+        except Exception:
+            battery = 0.0
+        return {
+            "battery": battery,
+            "mode": self.Mode,
+            "drive": self.drive.telemetry(),
+        }
 
-                    LX = int(data2 * math.sin(math.radians(data1)))
-                    LY = int(data2 * math.cos(math.radians(data1)))
-                    RX = int(data4 * math.sin(math.radians(data3)))
-                    RY = int(data4 * math.cos(math.radians(data3)))
+    def _stop_rotation(self):
+        """Cooperatively stop the CMD_CAR_ROTATE spin thread, if running."""
+        try:
+            self.PWM.stop_rotate()
+        except Exception:
+            pass
+        self.rotation_flag = False
+        t = self._rotate_thread
+        if t is not None and t.is_alive():
+            t.join(timeout=1.0)
+        self._rotate_thread = None
 
-                    FR = LY - LX + RX
-                    FL = LY + LX - RX
-                    BL = LY - LX - RX
-                    BR = LY + LX + RX
+    # ------------------------------------------------------------------
+    # Command handlers (registered in _build_router)
+    # ------------------------------------------------------------------
+    def _h_mode(self, c: Command):
+        mode = str(c.get('mode', c.arg(0)))
+        if mode in ('one', '0'):
+            self.stopMode()
+            self.Mode = 'one'
+        elif mode in ('two', '1'):
+            self.stopMode()
+            self.Mode = 'two'
+            self.lightRun = Thread(target=self.light.run, daemon=True)
+            self.lightRun.start()
+            self.Light = True
+            self.lightTimer = threading.Timer(0.3, self.sendLight)
+            self.lightTimer.start()
+        elif mode in ('three', '3'):
+            self.stopMode()
+            self.Mode = 'three'
+            self.ultrasonicRun = Thread(target=self.ultrasonic.run, daemon=True)
+            self.ultrasonicRun.start()
+            self.sonic = False
+            self.ultrasonicTimer = threading.Timer(5, self.sendUltrasonic)
+            self.ultrasonicTimer.start()
+        elif mode in ('four', '2'):
+            self.stopMode()
+            self.Mode = 'four'
+            self.infraredRun = Thread(target=self.infrared.run, daemon=True)
+            self.infraredRun.start()
+            self.Line = True
+            self.lineTimer = threading.Timer(0.4, self.sendLine)
+            self.lineTimer.start()
 
-                    self.PWM.setMotorModel(FL, BL, FR, BR)
-                except:
-                    pass
-            elif (cmd.CMD_CAR_ROTATE in data) and self.Mode == 'one':
-                try:
-                    data1 = int(data[1])
-                    data2 = int(data[2])
-                    data3 = int(data[3])
-                    data4 = int(data[4])
-                    if data4 == 0:
-                        try:
-                            stop_thread(self._rotate_mode)
-                            self.rotation_flag = False
-                        except:
-                            pass
-                        LX = int(data2 * math.sin(math.radians(data1)))
-                        LY = int(data2 * math.cos(math.radians(data1)))
-                        RX = int(data4 * math.sin(math.radians(data3)))
-                        RY = int(data4 * math.cos(math.radians(data3)))
+    def _h_motor(self, c: Command):
+        """Raw skid duty (bypasses PID). Legacy CMD_MOTOR / JSON {duty:[...]}."""
+        if self.Mode != 'one':
+            return
+        try:
+            duty = c.get('duty')
+            if duty and len(duty) >= 4:
+                d = [int(x) for x in duty[:4]]
+            else:
+                d = [c.arg_int(i) for i in range(4)]
+            self.drive.release()          # stop PID fighting the raw duty
+            self.PWM.setMotorModel(*d)
+        except Exception:
+            pass
 
-                        FR = LY - LX + RX
-                        FL = LY + LX - RX
-                        BL = LY - LX - RX
-                        BR = LY + LX + RX
+    def _h_drive(self, c: Command):
+        """Closed-loop velocity command (m/s, rad/s) -> engages PID."""
+        if self.Mode != 'one':
+            return
+        v = c.num('linear', 0, 0.0)
+        w = c.num('angular', 1, 0.0)
+        self.drive.set_twist(v, w)
 
-                        self.PWM.setMotorModel(FL, BL, FR, BR)
-                    elif self.rotation_flag == False:
-                        self.angle = data[3]
-                        try:
-                            stop_thread(self._rotate_mode)
-                        except:
-                            pass
-                        self.rotation_flag = True
-                        self._rotate_mode = Thread(target=self.PWM.Rotate, args=(data3,))
-                        self._rotate_mode.start()
-                except:
-                    pass
-            elif cmd.CMD_SERVO in data:
-                try:
-                    data1 = data[1]
-                    data2 = int(data[2])
-                    self.servo.setServoPwm(data1, data2)
-                except:
-                    pass
+    def _h_reset_odometry(self, c: Command):
+        self.drive.reset_odometry()
 
-            elif cmd.CMD_LED in data:
-                try:
-                    data1=int(data[1])
-                    data2=int(data[2])
-                    data3=int(data[3])
-                    data4=int(data[4])
-                    self.led.ledIndex(data1, data2, data3, data4)
-                except:
-                    pass
-            elif cmd.CMD_LED_MOD in data:
-                self.LedMoD = data[1]
-                if self.LedMoD == '0':
-                    try:
-                        stop_thread(self._led_mode)
-                    except:
-                        pass
-                if self.LedMoD == '1':
-                    try:
-                        stop_thread(self._led_mode)
-                    except:
-                        pass
-                    self.led.ledMode(self.LedMoD)
-                    time.sleep(0.1)
-                    self.led.ledMode(self.LedMoD)
-                else:
-                    try:
-                        stop_thread(self._led_mode)
-                    except:
-                        pass
-                    time.sleep(0.1)
-                    self._led_mode = Thread(target=self.led.ledMode, args=(data[1],))
-                    self._led_mode.start()
-            elif cmd.CMD_SONIC in data:
-                if data[1] == '1':
-                    self.sonic = True
-                    self.ultrasonicTimer = threading.Timer(0.5, self.sendUltrasonic)
-                    self.ultrasonicTimer.start()
-                else:
-                    self.sonic = False
-            elif cmd.CMD_BUZZER in data:
-                try:
-                    self.buzzer.run(data[1])
-                except:
-                    pass
-            elif cmd.CMD_LIGHT in data:
-                if data[1] == '1':
-                    self.Light = True
-                    self.lightTimer = threading.Timer(0.3, self.sendLight)
-                    self.lightTimer.start()
-                else:
-                    self.Light = False
-            elif cmd.CMD_POWER in data:
-                ADC_Power = self.adc.recvADC(2) * 5
-                try:
-                    self.send(cmd.CMD_POWER + '#' + str(round(ADC_Power, 2)) + '\n')
-                except:
-                    pass
+    def _h_mecanum(self, c: Command):
+        """Legacy mecanum joystick mix (CMD_M_MOTOR)."""
+        if self.Mode != 'one':
+            return
+        try:
+            a1, m1, a2, m2 = (c.arg_int(0), c.arg_int(1),
+                              c.arg_int(2), c.arg_int(3))
+            LX = int(m1 * math.sin(math.radians(a1)))
+            LY = int(m1 * math.cos(math.radians(a1)))
+            RX = int(m2 * math.sin(math.radians(a2)))
+
+            FR = LY - LX + RX
+            FL = LY + LX - RX
+            BL = LY - LX - RX
+            BR = LY + LX + RX
+            self.drive.release()
+            self.PWM.setMotorModel(FL, BL, FR, BR)
+        except Exception:
+            pass
+
+    def _h_car_rotate(self, c: Command):
+        if self.Mode != 'one':
+            return
+        try:
+            a1, m1, a2, m2 = (c.arg_int(0), c.arg_int(1),
+                              c.arg_int(2), c.arg_int(3))
+            if m2 == 0:
+                self._stop_rotation()
+                LX = int(m1 * math.sin(math.radians(a1)))
+                LY = int(m1 * math.cos(math.radians(a1)))
+                FR = LY - LX
+                FL = LY + LX
+                BL = LY - LX
+                BR = LY + LX
+                self.drive.release()
+                self.PWM.setMotorModel(FL, BL, FR, BR)
+            elif not self.rotation_flag:
+                self.angle = a2
+                self._stop_rotation()
+                self.drive.release()
+                self.rotation_flag = True
+                self._rotate_thread = Thread(target=self.PWM.Rotate,
+                                             args=(a2,), daemon=True)
+                self._rotate_thread.start()
+        except Exception:
+            pass
+
+    def _h_servo(self, c: Command):
+        try:
+            channel = str(c.get('channel', c.arg(0)))
+            angle = int(c.num('angle', 1, 90))
+            self.servo.setServoPwm(channel, angle)
+        except Exception:
+            pass
+
+    def _h_led(self, c: Command):
+        try:
+            index = int(c.num('index', 0, 255))
+            r = int(c.num('r', 1, 0))
+            g = int(c.num('g', 2, 0))
+            b = int(c.num('b', 3, 0))
+            self.led.ledIndex(index, r, g, b)
+        except Exception:
+            pass
+
+    def _h_led_mode(self, c: Command):
+        self.LedMoD = str(c.get('mode', c.arg(0)))
+        if self.LedMoD == '0':
+            self._stop_led_mode()
+        elif self.LedMoD == '1':
+            self._stop_led_mode()
+            self.led.ledMode(self.LedMoD)
+            time.sleep(0.1)
+            self.led.ledMode(self.LedMoD)
+        else:
+            self._stop_led_mode()
+            time.sleep(0.1)
+            self._led_mode = Thread(target=self.led.ledMode,
+                                    args=(self.LedMoD,), daemon=True)
+            self._led_mode.start()
+
+    def _stop_led_mode(self):
+        try:
+            stop_thread(self._led_mode)
+        except Exception:
+            pass
+
+    def _h_sonic(self, c: Command):
+        on = str(c.get('on', c.arg(0)))
+        if on in ('1', 'True', 'true'):
+            self.sonic = True
+            self.ultrasonicTimer = threading.Timer(0.5, self.sendUltrasonic)
+            self.ultrasonicTimer.start()
+        else:
+            self.sonic = False
+
+    def _h_buzzer(self, c: Command):
+        try:
+            on = c.get('on')
+            if on is None:
+                on = c.arg(0)
+            value = '1' if on in (True, '1', 'true', 'True') else '0'
+            self.buzzer.run(value)
+        except Exception:
+            pass
+
+    def _h_light(self, c: Command):
+        on = str(c.get('on', c.arg(0)))
+        if on in ('1', 'True', 'true'):
+            self.Light = True
+            self.lightTimer = threading.Timer(0.3, self.sendLight)
+            self.lightTimer.start()
+        else:
+            self.Light = False
+
+    def _h_power(self, c: Command):
+        try:
+            ADC_Power = self.adc.recvADC(2) * 5
+            self.send(cmd.CMD_POWER + '#' + str(round(ADC_Power, 2)) + '\n')
+        except Exception:
+            pass
 
     def sendUltrasonic(self):
         if self.sonic == True:

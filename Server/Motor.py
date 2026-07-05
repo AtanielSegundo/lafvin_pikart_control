@@ -1,39 +1,49 @@
 import math
+import threading
 from PCA9685 import PCA9685
 from ADC import *
 import time
 
 
 class Motor:
+    """Skid-steer motor driver over the PCA9685.
+
+    Implemented as a process-wide singleton: there is exactly one PCA9685 board
+    and one ADC, so every ``Motor()`` call (here, and in Light/Ultrasonic/
+    Line_Tracking) shares the same hardware instance instead of re-initialising
+    the I2C driver several times.
+    """
+
+    _instance = None
+    _lock = threading.Lock()
+
+    def __new__(cls, *args, **kwargs):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._initialized = False
+            return cls._instance
+
     def __init__(self):
+        if self._initialized:
+            return
         self.pwm = PCA9685(0x40, debug=True)
         self.pwm.setPWMFreq(50)
-        self.time_proportion = 2.5  # Depend on your own car,If you want to get the best out of the rotation mode,
-        # change the value by experimenting.
+        self.time_proportion = 2.5  # Depend on your own car. If you want to get
+        # the best out of the rotation mode, tune this by experimenting.
         self.adc = Adc()
+        self._rotate_stop = threading.Event()
+        self._initialized = True
 
     @staticmethod
     def duty_range(duty1, duty2, duty3, duty4):
-        if duty1 > 4095:
-            duty1 = 4095
-        elif duty1 < -4095:
-            duty1 = -4095
-
-        if duty2 > 4095:
-            duty2 = 4095
-        elif duty2 < -4095:
-            duty2 = -4095
-
-        if duty3 > 4095:
-            duty3 = 4095
-        elif duty3 < -4095:
-            duty3 = -4095
-
-        if duty4 > 4095:
-            duty4 = 4095
-        elif duty4 < -4095:
-            duty4 = -4095
-        return duty1, duty2, duty3, duty4
+        def clamp(d):
+            if d > 4095:
+                return 4095
+            if d < -4095:
+                return -4095
+            return d
+        return clamp(duty1), clamp(duty2), clamp(duty3), clamp(duty4)
 
     def left_Upper_Wheel(self, duty):
         if duty > 0:
@@ -86,12 +96,26 @@ class Motor:
         self.right_Upper_Wheel(duty3)
         self.right_Lower_Wheel(duty4)
 
-    def Rotate(self, n):
-        angle = n
-        bat_compensate = 7.5 / (self.adc.recvADC(2) * 3)
-        while True:
-            W = 2000
+    def stop(self):
+        self.setMotorModel(0, 0, 0, 0)
 
+    def stop_rotate(self):
+        """Cooperatively stop a running :meth:`Rotate` loop."""
+        self._rotate_stop.set()
+
+    def Rotate(self, n):
+        """Spin the car continuously, sweeping the heading by 5 degrees/step.
+
+        Runs until :meth:`stop_rotate` is called (cooperative, unlike the old
+        version that relied on injecting an async exception into the thread).
+        """
+        self._rotate_stop.clear()
+        angle = n
+        adc_reading = self.adc.recvADC(2) * 3
+        # Guard against a zero/low ADC reading (was a divide-by-zero).
+        bat_compensate = 7.5 / adc_reading if adc_reading > 0.1 else 1.0
+        while not self._rotate_stop.is_set():
+            W = 2000
             VY = int(2000 * math.cos(math.radians(angle)))
             VX = -int(2000 * math.sin(math.radians(angle)))
 
@@ -100,10 +124,11 @@ class Motor:
             BL = VY - VX - W
             BR = VY + VX + W
 
-            PWM.setMotorModel(FL, BL, FR, BR)
-            print("rotating")
-            time.sleep(5 * self.time_proportion * bat_compensate / 1000)
+            self.setMotorModel(FL, BL, FR, BR)   # use this instance, not a global
+            # Interruptible sleep so stop_rotate() takes effect promptly.
+            self._rotate_stop.wait(5 * self.time_proportion * bat_compensate / 1000)
             angle -= 5
+        self.setMotorModel(0, 0, 0, 0)
 
 
 PWM = Motor()
@@ -128,5 +153,5 @@ def destroy():
 if __name__ == '__main__':
     try:
         loop()
-    except KeyboardInterrupt:  # When 'Ctrl+C' is pressed, the child program destroy() will be  executed.
+    except KeyboardInterrupt:  # When 'Ctrl+C' is pressed, destroy() is executed.
         destroy()
