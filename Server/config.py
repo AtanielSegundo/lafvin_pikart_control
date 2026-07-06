@@ -124,7 +124,7 @@ class SideMapping:
     right: Tuple[str, ...] = ("M3", "M4")
     # Per-motor count direction (+1 / -1).
     signs: Dict[str, int] = field(default_factory=lambda: {
-        "M1": 1, "M2": 1, "M3": -1, "M4": 1,
+        "M1": 1, "M2": 1, "M3": 1, "M4": -1,
     })
 
 
