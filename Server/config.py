@@ -79,17 +79,30 @@ class PositionGains:
 
 # ---------------------------------------------------------------------------
 # Encoder wiring: motor tag -> (phase_a_gpio, phase_b_gpio)
-# BCM pin numbering. Taken from the original encoders.py mapping.
+# BCM pin numbering.
 #
 # Physical positions on this build:
 #   M1 = upper-left    M4 = upper-right
 #   M2 = lower-left    M3 = lower-right
+#
+# NOTE: M1/M4 were originally listed on GPIO 12/13 and 10/11, but those encoders
+# were physically plugged into the PCA9685 "SERVO_2..5" headers -- PCA9685 *chip*
+# outputs driven over I2C, NOT the Pi GPIO of the same numbers -- so pigpio never
+# saw an edge (pins floated at the pull-up, always HIGH). Now rewired to real Pi
+# GPIO:
+#   M1 -> GPIO 5 (phys pin 29), GPIO 6 (phys pin 31)   -- clean GPIO
+#   M4 -> GPIO 7 (phys pin 26), GPIO 8 (phys pin 24)   -- SPI0 CE1/CE0
+# GPIO 7/8 are the SPI0 chip-select pins, so SPI0 MUST be disabled for pigpio to
+# own them: comment out `dtparam=spi=on` in /boot/firmware/config.txt and reboot.
+# The only SPI0 user was the WS2812 LED strip (Led.py), which is unused here.
+# Power the M1/M4 encoders from the SAME supply as M2/M3 (3.3 V) so the outputs
+# stay in the Pi's GPIO-safe range -- the header pins are NOT 5 V tolerant.
 # ---------------------------------------------------------------------------
 ENCODER_PINS: Dict[str, Tuple[int, int]] = {
-    "M1": (12, 13),   # upper-left   (SERVO_4, SERVO_5 headers)
+    "M1": (0, 5),     # upper-left   (rewired to Pi GPIO, phys pins 29/31)
     "M2": (26, 20),   # lower-left
     "M3": (19, 16),   # lower-right
-    "M4": (10, 11),   # upper-right  (SERVO_2, SERVO_3 headers)
+    "M4": (8, 7),     # upper-right  (rewired to Pi GPIO SPI0 pins; needs SPI off)
 }
 
 # Which motor tags belong to which side, and the sign of their counts so that
@@ -111,7 +124,7 @@ class SideMapping:
     right: Tuple[str, ...] = ("M3", "M4")
     # Per-motor count direction (+1 / -1).
     signs: Dict[str, int] = field(default_factory=lambda: {
-        "M1": 1, "M2": 1, "M3": 1, "M4": 1,
+        "M1": 1, "M2": 1, "M3": -1, "M4": 1,
     })
 
 
