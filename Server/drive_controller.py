@@ -29,7 +29,7 @@ import math
 
 from config import CONFIG, RobotConfig
 from kinematics import SkidSteerKinematics, Twist, WheelSpeeds
-from odometry import Pose, SkidSteerOdometry, wrap_angle
+from odometry import Pose, SkidSteerOdometry
 from pid import PID
 
 
@@ -50,16 +50,24 @@ class DriveController:
         self.kin = SkidSteerKinematics(config.wheel)
         self.odom = SkidSteerOdometry(config.wheel)
 
+        # Velocity PIDs (teleop / `drive`): error in m/s -> duty.
         gains = config.pid
         self.pid_left = PID(gains.kp, gains.ki, gains.kd, gains.feedforward,
                             gains.output_limit, gains.integral_limit)
         self.pid_right = PID(gains.kp, gains.ki, gains.kd, gains.feedforward,
                              gains.output_limit, gains.integral_limit)
 
+        # Position PIDs (drive_distance / turn): error in METRES -> duty.
+        pg = config.position
+        self.pos_left = PID(pg.kp, pg.ki, pg.kd, 0.0,
+                            pg.output_limit, pg.integral_limit)
+        self.pos_right = PID(pg.kp, pg.ki, pg.kd, 0.0,
+                             pg.output_limit, pg.integral_limit)
+
         self._target = Twist()
         self._target_time = clock()
         self._engaged = False
-        self._goal = None          # active distance/turn goal, if any
+        self._move = None          # active position move, if any
         self._lock = threading.Lock()
 
         self._thread: Optional[threading.Thread] = None
@@ -78,10 +86,10 @@ class DriveController:
             self._engaged = True
 
     def set_twist(self, linear: float, angular: float) -> None:
-        """Command a body velocity (m/s, rad/s). Cancels any active goal and
-        engages closed-loop control."""
+        """Command a body velocity (m/s, rad/s). Cancels any active move and
+        engages velocity control."""
         with self._lock:
-            self._goal = None
+            self._move = None
         self._apply_target(linear, angular)
 
     def set_wheel_speeds(self, left: float, right: float) -> None:
@@ -96,30 +104,48 @@ class DriveController:
         """Hand motor control back to raw duty commands; keep odometry alive."""
         with self._lock:
             self._engaged = False
-            self._goal = None
+            self._move = None
             self._target = Twist()
         self.pid_left.reset()
         self.pid_right.reset()
+        self.pos_left.reset()
+        self.pos_right.reset()
 
-    # -- high-level motion goals (closed-loop on odometry) -----------------
-    def drive_distance(self, distance: float, speed: float = 0.2) -> None:
-        """Drive straight for ``distance`` metres (negative = reverse), holding
-        heading, then stop. Progress is measured by the encoders/odometry."""
+    # -- high-level moves (per-side POSITION control) ----------------------
+    def drive_distance(self, distance: float, speed: float = None) -> None:
+        """Drive straight ``distance`` metres (negative = reverse) and stop.
+
+        Both sides are given the same distance target, so a per-side position
+        PID keeps them equal -> straight line. Closed on the encoders.
+        (``speed`` is accepted for API compatibility; the move speed is set by
+        the position gains' output_limit.)
+        """
+        self._start_move(distance, distance)
+
+    def turn_in_place(self, angle_deg: float, ang_speed: float = None) -> None:
+        """Rotate in place by ``angle_deg`` (positive = ccw) and stop.
+
+        A ccw turn of angle a rotates the body by a = (s_right - s_left)/track
+        with s_left = -s, s_right = +s, so each side must travel
+        s = a * track / 2 in opposite directions.
+        """
+        s = math.radians(angle_deg) * self.config.wheel.track / 2.0
+        self._start_move(-s, s)
+
+    def _start_move(self, target_left: float, target_right: float) -> None:
+        self.pos_left.reset()
+        self.pos_right.reset()
         with self._lock:
-            self._goal = _StraightGoal(distance, speed)
+            self._move = _PositionMove(target_left, target_right,
+                                       self.config.position)
             self._engaged = True
-            self._target_time = self._clock()
 
-    def turn_in_place(self, angle_deg: float, ang_speed: float = 1.0) -> None:
-        """Rotate in place by ``angle_deg`` (positive = ccw), then stop."""
+    def move_active(self) -> bool:
         with self._lock:
-            self._goal = _TurnGoal(math.radians(angle_deg), ang_speed)
-            self._engaged = True
-            self._target_time = self._clock()
+            return self._move is not None
 
-    def goal_active(self) -> bool:
-        with self._lock:
-            return self._goal is not None
+    # Backwards-compatible alias.
+    goal_active = move_active
 
     def _current_target(self) -> tuple[Twist, bool]:
         with self._lock:
@@ -145,49 +171,68 @@ class DriveController:
         self.odom.update_from_distances(d_left, d_right, dt)
         measured = WheelSpeeds(left=d_left / dt, right=d_right / dt)
 
-        # 1b. Service an active motion goal: it drives the target twist from
-        #     odometry progress and finishes on its own.
-        d_center = (d_left + d_right) / 2.0
-        d_theta = (d_right - d_left) / self.config.wheel.track
+        # 2. Choose control mode: a position MOVE takes priority; otherwise
+        #    fall back to velocity control (teleop / `drive`).
         with self._lock:
-            goal = self._goal
-        if goal is not None:
-            twist, done = goal.update(d_center, d_theta, self.odom.pose)
-            if done:
-                with self._lock:
-                    if self._goal is goal:
-                        self._goal = None
-                goal = None                       # reflect completion in telemetry
-                self._apply_target(0.0, 0.0)
-            else:
-                self._apply_target(twist.linear, twist.angular)
+            move = self._move
 
-        # 2. Target wheel speeds from the commanded twist.
-        target, engaged = self._current_target()
-        wheel_target = self.kin.inverse(target)
+        target = Twist()
+        wheel_target = WheelSpeeds()
+        move_info = None
 
-        # 3. PID -> duty (only when engaged; otherwise leave motors alone).
-        if engaged:
-            if target.linear == 0.0 and target.angular == 0.0:
-                # Hard stop: clear integrators so we don't creep.
-                self.pid_left.reset()
-                self.pid_right.reset()
+        if move is not None:
+            # --- POSITION control: per-side distance PID -> duty ---
+            move.accumulate(d_left, d_right, dt)
+            duty_left = self.pos_left.update(move.target_left,
+                                             move.traveled_left, dt)
+            duty_right = self.pos_right.update(move.target_right,
+                                               move.traveled_right, dt)
+            if move.is_done(measured.left, measured.right):
                 duty_left = duty_right = 0.0
+                self.pos_left.reset()
+                self.pos_right.reset()
+                with self._lock:
+                    if self._move is move:
+                        self._move = None
+                move = None                       # reflect completion in telemetry
             else:
-                duty_left = self.pid_left.update(wheel_target.left,
-                                                 measured.left, dt)
-                duty_right = self.pid_right.update(wheel_target.right,
-                                                   measured.right, dt)
+                err_l, err_r = move.errors()
+                move_info = {
+                    "target": {"left": round(move.target_left, 4),
+                               "right": round(move.target_right, 4)},
+                    "traveled": {"left": round(move.traveled_left, 4),
+                                 "right": round(move.traveled_right, 4)},
+                    "remaining": {"left": round(err_l, 4),
+                                  "right": round(err_r, 4)},
+                }
+            engaged = True
             self.motor.setMotorModel(int(round(duty_left)), int(round(duty_left)),
                                      int(round(duty_right)), int(round(duty_right)))
         else:
-            duty_left = duty_right = 0.0
+            # --- VELOCITY control ---
+            target, engaged = self._current_target()
+            wheel_target = self.kin.inverse(target)
+            if engaged:
+                if target.linear == 0.0 and target.angular == 0.0:
+                    self.pid_left.reset()
+                    self.pid_right.reset()
+                    duty_left = duty_right = 0.0
+                else:
+                    duty_left = self.pid_left.update(wheel_target.left,
+                                                     measured.left, dt)
+                    duty_right = self.pid_right.update(wheel_target.right,
+                                                       measured.right, dt)
+                self.motor.setMotorModel(
+                    int(round(duty_left)), int(round(duty_left)),
+                    int(round(duty_right)), int(round(duty_right)))
+            else:
+                duty_left = duty_right = 0.0
 
-        # 4. Advance the simulated plant (no-op on real hardware).
+        # 3. Advance the simulated plant (no-op on real hardware).
         if self.plant is not None:
             self.plant.step(duty_left, duty_right, dt)
 
-        # 5. Publish telemetry.
+        # 4. Publish telemetry.
         snapshot = {
             "pose": self.odom.pose.as_dict(),
             "twist": {"linear": round(self.odom.linear_velocity, 4),
@@ -199,7 +244,9 @@ class DriveController:
                              "right": round(wheel_target.right, 4)},
             "duty": {"left": int(round(duty_left)), "right": int(round(duty_right))},
             "engaged": engaged,
-            "goal_active": goal is not None,
+            "goal_active": move is not None,
+            "move": move_info,
+            "encoders": self.encoders.raw_totals(),   # raw per-motor counts
         }
         with self._lock:
             self._telemetry = snapshot
@@ -258,6 +305,8 @@ class DriveController:
             "duty": {"left": 0, "right": 0},
             "engaged": False,
             "goal_active": False,
+            "move": None,
+            "encoders": {},
         }
 
 
@@ -267,62 +316,38 @@ def _twist_from_wheels(kin: SkidSteerKinematics, left: float,
     return t.linear, t.angular
 
 
-class _StraightGoal:
-    """Drive a fixed distance in a straight line, closed-loop on odometry.
+class _PositionMove:
+    """A per-side distance target serviced by the position PIDs.
 
-    Progress is the accumulated path length (from encoder deltas). Speed tapers
-    down near the end to limit overshoot, and a proportional heading term holds
-    the initial heading so the path stays straight.
+    Straight move: both targets equal (= distance). In-place turn: equal and
+    opposite. Travel is accumulated from the encoder deltas each step; the move
+    finishes when both sides are within tolerance and have stopped (or on a
+    safety timeout).
     """
 
-    def __init__(self, distance: float, speed: float,
-                 heading_gain: float = 3.0, decel_dist: float = 0.15,
-                 tolerance: float = 0.005, min_speed: float = 0.03):
-        self.remaining = abs(distance)
-        self.direction = 1.0 if distance >= 0 else -1.0
-        self.speed = abs(speed)
-        self.heading_gain = heading_gain
-        self.decel_dist = max(1e-3, decel_dist)
-        self.tolerance = tolerance
-        self.min_speed = min_speed
-        self.theta0 = None
+    def __init__(self, target_left: float, target_right: float, gains):
+        self.target_left = target_left
+        self.target_right = target_right
+        self.traveled_left = 0.0
+        self.traveled_right = 0.0
+        self.elapsed = 0.0
+        self.g = gains
 
-    def update(self, d_center, d_theta, pose):
-        if self.theta0 is None:
-            self.theta0 = pose.theta
-        self.remaining -= abs(d_center)
-        if self.remaining <= self.tolerance:
-            return Twist(0.0, 0.0), True
-        v = self.speed
-        if self.remaining < self.decel_dist:
-            v = max(self.min_speed, self.speed * (self.remaining / self.decel_dist))
-        # Heading hold: steer back toward the starting heading.
-        heading_err = wrap_angle(pose.theta - self.theta0)
-        w = -self.heading_gain * heading_err
-        return Twist(self.direction * v, w), False
+    def accumulate(self, d_left: float, d_right: float, dt: float) -> None:
+        self.traveled_left += d_left
+        self.traveled_right += d_right
+        self.elapsed += dt
 
+    def errors(self) -> tuple[float, float]:
+        return (self.target_left - self.traveled_left,
+                self.target_right - self.traveled_right)
 
-class _TurnGoal:
-    """Rotate in place by a fixed angle, closed-loop on odometry heading."""
-
-    def __init__(self, angle_rad: float, ang_speed: float,
-                 decel_angle: float = 0.35, tolerance: float = 0.01,
-                 min_speed: float = 0.2):
-        self.remaining = abs(angle_rad)
-        self.direction = 1.0 if angle_rad >= 0 else -1.0
-        self.speed = abs(ang_speed)
-        self.decel_angle = max(1e-3, decel_angle)
-        self.tolerance = tolerance
-        self.min_speed = min_speed
-
-    def update(self, d_center, d_theta, pose):
-        self.remaining -= abs(d_theta)
-        if self.remaining <= self.tolerance:
-            return Twist(0.0, 0.0), True
-        w = self.speed
-        if self.remaining < self.decel_angle:
-            w = max(self.min_speed, self.speed * (self.remaining / self.decel_angle))
-        return Twist(0.0, self.direction * w), False
+    def is_done(self, meas_left: float, meas_right: float) -> bool:
+        err_l, err_r = self.errors()
+        arrived = (abs(err_l) < self.g.tolerance and abs(err_r) < self.g.tolerance
+                   and abs(meas_left) < self.g.stop_speed
+                   and abs(meas_right) < self.g.stop_speed)
+        return arrived or self.elapsed >= self.g.max_time
 
 
 class SimulatedDrivePlant:

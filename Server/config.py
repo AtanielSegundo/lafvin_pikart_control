@@ -44,7 +44,7 @@ class WheelGeometry:
 
 
 # ---------------------------------------------------------------------------
-# PID gains for per-side wheel-velocity control
+# PID gains for per-side wheel-VELOCITY control (used for teleop / `drive`).
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class PIDGains:
@@ -56,6 +56,25 @@ class PIDGains:
     feedforward: float = 2600.0
     output_limit: float = 4095.0      # matches Motor duty range
     integral_limit: float = 4095.0    # anti-windup clamp on the integral term
+
+
+# ---------------------------------------------------------------------------
+# PID gains for per-side POSITION/DISTANCE control (used for drive_distance /
+# turn). Error is in METRES of remaining travel; output is PWM duty.
+#   - kd damps velocity (d(pos_error)/dt = -wheel_speed), preventing overshoot.
+#   - output_limit caps how hard a move pushes, so moves are gentle & safe.
+# These MUST be tuned on hardware once the encoders are calibrated.
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class PositionGains:
+    kp: float = 12000.0      # duty per metre of error
+    ki: float = 0.0
+    kd: float = 1500.0       # duty per (m/s) — damping
+    output_limit: float = 1800.0     # gentle duty cap during moves
+    integral_limit: float = 800.0
+    tolerance: float = 0.01          # m, arrival tolerance
+    stop_speed: float = 0.03         # m/s below which we consider it stopped
+    max_time: float = 20.0           # s, safety timeout per move
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +154,7 @@ class NetworkConfig:
 class RobotConfig:
     wheel: WheelGeometry = field(default_factory=WheelGeometry)
     pid: PIDGains = field(default_factory=PIDGains)
+    position: PositionGains = field(default_factory=PositionGains)
     sides: SideMapping = field(default_factory=SideMapping)
     control: ControlConfig = field(default_factory=ControlConfig)
     network: NetworkConfig = field(default_factory=NetworkConfig)

@@ -17,7 +17,7 @@ any machine — no Pi required.
 |------|-------|
 | Control stack (config, PID, kinematics, odometry, encoders, drive controller) | ✅ implemented + unit-tested off-Pi |
 | Wire protocol (JSON + legacy, command router, telemetry) | ✅ implemented + unit-tested |
-| Unit tests (`tests/test_core.py`) | ✅ 23 tests, all passing (see *Testing*) |
+| Unit tests (`tests/test_core.py`) | ✅ 28 tests, all passing (see *Testing*) |
 | `server.py` dispatch → `CommandRouter` + drive controller | ✅ done |
 | `web.py` telemetry broadcast + JSON WS handling | ✅ done |
 | `static/index.html` odometry display + closed-loop toggle | ✅ done |
@@ -59,9 +59,9 @@ any machine — no Pi required.
 ```
 
 ### Design principles applied by the refactor
-- **Hardware behind a shim.** `gpio_backend.py` returns real `RPi.GPIO` on the
-  Pi and a no-op mock elsewhere, so every pure-logic module imports and runs on
-  a laptop/CI.
+- **Hardware behind a fallback.** Encoders use **pigpio**; when pigpio/pigpiod
+  is unavailable (laptop/CI) `WheelEncoders` transparently falls back to
+  `SimulatedEncoder`, so every pure-logic module imports and runs anywhere.
 - **Dependency injection.** `DriveController` receives its `motor` and
   `encoders` instead of constructing them, so the same object runs against real
   hardware or a `SimulatedDrivePlant`.
@@ -79,12 +79,11 @@ any machine — no Pi required.
 | File | Responsibility |
 |------|----------------|
 | `config.py` | Dataclasses for wheel geometry, PID gains, encoder pins, motor channels, side mapping, control/network settings. Exposes a ready `CONFIG`. |
-| `gpio_backend.py` | `GPIO` + `ON_HARDWARE` — real `RPi.GPIO` or mock fallback. |
 | `pid.py` | Reusable, time-aware `PID` with anti-windup, output clamp, feed-forward, `reset()`. |
 | `kinematics.py` | `SkidSteerKinematics` forward/inverse, `Twist`, `WheelSpeeds`. |
 | `odometry.py` | `SkidSteerOdometry` pose integration, `Pose`, `wrap_angle`. |
-| `encoders.py` | Quadrature `Encoder` (IRQ-driven, x4), `SimulatedEncoder`, `WheelEncoders` per-side aggregator. |
-| `drive_controller.py` | `DriveController` closed loop + `SimulatedDrivePlant`. |
+| `encoders.py` | pigpio quadrature `Encoder` (x4, glitch-filtered), `SimulatedEncoder`, `WheelEncoders` per-side aggregator + raw-count diagnostics. |
+| `drive_controller.py` | `DriveController` — velocity + position PID loops, `SimulatedDrivePlant`. |
 | `protocol.py` | `parse()`, `Command`, `CommandRouter`, telemetry/sensor JSON builders. |
 | `tests/test_core.py` | Unit tests for all of the above. |
 
@@ -100,12 +99,12 @@ equal to the lateral spacing between sides.
 **Wheel geometry** (`config.WheelGeometry`, from the reference `TiredWheel`):
 `diameter = 0.065 m`, `track = 0.151 m`. Distance per encoder count is
 `π·diameter / counts_per_rev`.
-> ⚠️ `counts_per_rev` defaults to `1560` as a placeholder — **calibrate it** for
+> ⚠️ `counts_per_rev` defaults to `2340` (13 PPR × 45:1 × 4) — **calibrate it** for
 > your motors (spin one wheel exactly N turns, read the count).
 
-**Quadrature decoding** (`encoders.py`). Both edges of both phases are counted
-(x4). The transition delta is looked up by `(prev_state << 2) | new_state` where
-`state = (A << 1) | B`:
+**Quadrature decoding** (`encoders.py`, **pigpio**). Both edges of both phases
+are counted (x4). The transition delta is looked up by
+`(prev_state << 2) | new_state` where `state = (A << 1) | B`:
 
 ```
         new →  00   01   10   11
@@ -115,8 +114,19 @@ equal to the lateral spacing between sides.
    prev 11:     0,   1,  -1,   0
 ```
 
-Counting is interrupt-driven on the Pi (GPIO `add_event_detect`). Off-Pi,
-`SimulatedEncoder` accepts injected ticks so tests are deterministic.
+Counting is serviced by the **pigpio daemon (pigpiod)** in C, not by Python
+callbacks. This matters: at 2340 counts/rev (13 PPR × 45:1 × 4) the edge rate
+at speed is far too high for RPi.GPIO's Python callbacks, which silently drop
+edges and under-count. Each phase gets a 100 µs hardware glitch filter for
+debounce. Off-Pi (no pigpio/pigpiod), `WheelEncoders` falls back to
+`SimulatedEncoder` so the stack still imports and the tests run.
+
+> Requires the daemon:  **`sudo pigpiod`** (start on boot with
+> `sudo systemctl enable pigpiod`).
+
+Each encoder also keeps a **lifetime raw count** exposed in telemetry
+(`drive.encoders`) — the ground truth for calibrating signs and
+`counts_per_rev` (see *Calibration*).
 
 **Odometry** (`odometry.py`) integrates per-side distance deltas — identical
 update to the reference, but using the **midpoint heading** for better arcs:
@@ -138,12 +148,22 @@ v_left  = v − w · track/2
 v_right = v + w · track/2
 ```
 
-**Closed loop** (`drive_controller.py`), once per control tick (default 50 Hz):
-1. read encoder count deltas → distances → update odometry + measured speeds;
-2. inverse-kinematics the target `Twist` → target side speeds;
-3. per-side `PID` (with static feed-forward) → PWM duty;
-4. `Motor.setMotorModel(left, left, right, right)`;
-5. publish a telemetry snapshot (pose, twist, wheel speeds/targets, duties).
+**Two control modes** (`drive_controller.py`), once per control tick (50 Hz):
+
+*Velocity mode* (teleop / `drive`): inverse-kinematics the target `Twist` →
+per-side target speed → per-side velocity `PID` (+feed-forward) → duty.
+
+*Position mode* (`drive_distance` / `turn`): the move sets a per-side **distance
+target** and a per-side **position PID** drives duty from the *distance* error
+(error in metres, not m/s). Both sides share the same target for a straight
+line (so they stay equal → straight) or equal-and-opposite for a turn. The move
+finishes when both sides are within `tolerance` and stopped. This is the
+"PID on distance, not velocity" approach — more robust for point-to-point moves
+because it doesn't rely on differentiating encoder counts into a velocity.
+
+Both modes then `Motor.setMotorModel(left, left, right, right)` and publish a
+telemetry snapshot (pose, twist, wheel speeds, duties, raw encoder counts, and
+— during a move — per-side target/traveled/remaining).
 
 **Saturation & anti-windup** (`pid.py`). The output is clamped to
 `±output_limit` (4095, the Motor duty range — `Motor.duty_range` clamps again,
@@ -156,14 +176,35 @@ so it's defense-in-depth). Integral windup is handled two ways:
   `ki·integral` (in duty units, not the raw accumulator), reflected back into
   the stored state as a backstop.
 
-**High-level moves** (`drive_distance`, `turn_in_place`). These are motion
-*goals* the control loop services each tick, closed on the odometry: it drives
-the target twist, tapers speed near the end to limit overshoot (a heading term
-holds the line straight), and stops itself when the measured travel reaches the
-target. In the simulated plant, `drive_distance(3.0)` stops within ~0.5 cm.
-> Real-world accuracy depends on **`counts_per_rev` calibration** and, for
-> skid-steer, **wheel slip** (worse in turns). Expect good straight-line
-> accuracy once calibrated; treat turn angles as approximate.
+**High-level moves** (`drive_distance`, `turn_in_place`) use the position PID
+above: each side servos to its distance target and stops within `tolerance`.
+In the slip-free simulated plant, `drive_distance(3.0)` stops within ~1 cm.
+> Real-world accuracy depends on **`counts_per_rev` calibration**, correct
+> **encoder signs**, and — for skid-steer — **wheel slip** (worst in turns).
+> A 1 cm/side arrival tolerance on the 15 cm track maps to ~0.13 rad of heading,
+> so treat turn angles as approximate; precise turns want a heading sensor.
+
+## Calibration (do this first, on the robot)
+
+Everything downstream assumes the encoders read *forward → positive, equal on
+both sides*. Verify with the raw counts in telemetry:
+
+1. Start the daemon: `sudo pigpiod`, then run the server.
+2. Watch raw counts (`python ws_probe.py 8` reads `drive.encoders`), or the
+   `/status`/WebSocket telemetry.
+3. **Push the robot straight forward by hand ~1 m.** Every one of M1–M4 should
+   increase (positive). If a motor goes **negative**, set its entry in
+   `SideMapping.signs` (`config.py`) to `-1`. If a whole side is negative, flip
+   both of that side's signs.
+4. **Calibrate `counts_per_rev`:** spin one wheel exactly N full turns by hand
+   and read that motor's raw count; `counts_per_rev = raw_count / N`. (For the
+   13 PPR × 45:1 motor with x4 decoding that's 13·45·4 = **2340**.)
+5. Re-check: a hand-pushed 1 m forward should now read pose `x ≈ 1.0`,
+   `y ≈ 0`, `θ ≈ 0`. Only then run closed-loop moves.
+
+> ⚠️ Do **not** run `drive_distance` before this: a position loop with an
+> under-counting encoder keeps driving until it *thinks* it arrived, so it
+> overshoots badly.
 
 Engagement: the controller is **released** by default (odometry keeps running,
 motors untouched so raw `CMD_MOTOR` duty still works). A velocity command
@@ -218,9 +259,14 @@ Everything tunable is in `config.py`. Common knobs:
 - `WheelGeometry.counts_per_rev` — **calibrate first** (see above).
 - `SideMapping.signs` — flip a `-1`/`+1` if a wheel counts backwards, or
   `left`/`right` tag groups if a side is mirrored. No logic changes needed.
-- `PIDGains` — `kp/ki/kd`, plus `feedforward` (duty to hold 1 m/s),
+- `PIDGains` — velocity loop: `kp/ki/kd`, `feedforward` (duty to hold 1 m/s),
   `output_limit` (saturation, ±4095) and `integral_limit` (bounds the
   `ki·integral` contribution, in duty units).
+- `PositionGains` — distance loop (`drive_distance`/`turn`): `kp` (duty per
+  metre), `kd` (damping), `output_limit` (gentle move-speed cap), `tolerance`
+  (arrival, m), `stop_speed`, `max_time` (safety timeout). **Tune on hardware.**
+  Note: `ki` defaults to 0; if moves stall short due to stiction, add a small
+  `ki` (with the built-in anti-windup) to close the last bit.
 - `ControlConfig` — `loop_hz`, `telemetry_hz`, `command_timeout`,
   `max_linear`, `max_angular`.
 - `NetworkConfig` — ports and the network interface name.
@@ -237,7 +283,7 @@ cd Server
 python -m unittest discover -s tests -v
 ```
 
-Coverage (`tests/test_core.py`, 23 tests):
+Coverage (`tests/test_core.py`, 28 tests):
 - **PID** — output sign, saturation clamp, feed-forward, integral-term clamp,
   **no windup during saturation** (unreachable setpoint pins the output, then
   the setpoint drops and the output must recover immediately), and that the
@@ -260,9 +306,13 @@ Coverage (`tests/test_core.py`, 23 tests):
 ## Running (on the Pi)
 
 ```bash
+sudo pigpiod                     # start the GPIO daemon (needed for encoders)
 sudo python3 web.py              # web only (port 8080)
 sudo python3 web.py --with-tcp   # web + legacy TCP (5000/8000) + power monitor
 ```
+
+Dependencies: `aiohttp`, `pigpio` (+ `sudo pigpiod` running), `picamera2`,
+`smbus`, `RPi.GPIO`, `rpi_ws281x`.
 
 ---
 

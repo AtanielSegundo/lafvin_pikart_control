@@ -215,7 +215,7 @@ class TestDriveControllerClosedLoop(unittest.TestCase):
         self.assertFalse(tel["engaged"])
         self.assertEqual(tel["duty"], {"left": 0, "right": 0})
 
-    def _run_until_goal_done(self, ctrl, dt, max_steps=6000):
+    def _run_until_move_done(self, ctrl, dt, max_steps=6000):
         tel = {}
         for _ in range(max_steps):
             tel = ctrl.step(dt)
@@ -224,34 +224,59 @@ class TestDriveControllerClosedLoop(unittest.TestCase):
         return tel
 
     def test_drive_distance_reaches_target(self):
+        # Position PID: drives 3 m straight and stops, closed on the encoders.
         ctrl = self._make()
         dt = 1.0 / CONFIG.control.loop_hz
-        ctrl.drive_distance(3.0, speed=0.3)
-        tel = self._run_until_goal_done(ctrl, dt)
+        ctrl.drive_distance(3.0)
+        tel = self._run_until_move_done(ctrl, dt)
         self.assertFalse(tel["goal_active"])
-        # Stopped within a couple cm of 3 m, and stayed straight.
-        self.assertAlmostEqual(tel["pose"]["x"], 3.0, delta=0.03)
-        self.assertAlmostEqual(tel["pose"]["y"], 0.0, delta=0.03)
-        # A few steps later it is holding still.
+        self.assertAlmostEqual(tel["pose"]["x"], 3.0, delta=0.02)
+        self.assertAlmostEqual(tel["pose"]["y"], 0.0, delta=0.02)
+        # Holds still afterwards.
         for _ in range(20):
             tel = ctrl.step(dt)
         self.assertEqual(tel["duty"], {"left": 0, "right": 0})
 
+    def test_drive_distance_short_move(self):
+        # The exact case from the field: 0.24 m straight.
+        ctrl = self._make()
+        dt = 1.0 / CONFIG.control.loop_hz
+        ctrl.drive_distance(0.24)
+        tel = self._run_until_move_done(ctrl, dt)
+        self.assertAlmostEqual(tel["pose"]["x"], 0.24, delta=0.01)
+        self.assertAlmostEqual(tel["pose"]["theta"], 0.0, delta=0.02)
+
     def test_drive_distance_reverse(self):
         ctrl = self._make()
         dt = 1.0 / CONFIG.control.loop_hz
-        ctrl.drive_distance(-1.0, speed=0.25)
-        tel = self._run_until_goal_done(ctrl, dt)
-        self.assertAlmostEqual(tel["pose"]["x"], -1.0, delta=0.03)
+        ctrl.drive_distance(-1.0)
+        tel = self._run_until_move_done(ctrl, dt)
+        self.assertAlmostEqual(tel["pose"]["x"], -1.0, delta=0.02)
 
     def test_turn_in_place_reaches_angle(self):
         ctrl = self._make()
         dt = 1.0 / CONFIG.control.loop_hz
-        ctrl.turn_in_place(90.0, ang_speed=1.2)
-        tel = self._run_until_goal_done(ctrl, dt)
+        ctrl.turn_in_place(90.0)
+        tel = self._run_until_move_done(ctrl, dt)
         self.assertFalse(tel["goal_active"])
-        self.assertAlmostEqual(tel["pose"]["theta"], math.pi / 2, delta=0.05)
+        # The move stops when each side is within `tolerance` (1 cm) of its
+        # target; on a 0.151 m track that maps to up to ~2*tol/track rad of
+        # heading, so the achievable angle band is ~0.13 rad, not tighter.
+        band = 2 * CONFIG.position.tolerance / CONFIG.wheel.track + 0.02
+        self.assertAlmostEqual(tel["pose"]["theta"], math.pi / 2, delta=band)
         self.assertAlmostEqual(tel["pose"]["x"], 0.0, delta=0.03)
+
+    def test_raw_encoder_totals_exposed(self):
+        # Telemetry must surface raw per-motor counts for calibration.
+        ctrl = self._make()
+        dt = 1.0 / CONFIG.control.loop_hz
+        ctrl.drive_distance(0.5)
+        tel = self._run_until_move_done(ctrl, dt)
+        enc = tel["encoders"]
+        self.assertEqual(set(enc.keys()), {"M1", "M2", "M3", "M4"})
+        # In the (slip-free, correctly-signed) sim, all four counted forward.
+        for tag, total in enc.items():
+            self.assertGreater(total, 0, f"{tag} did not count positive")
 
 
 class TestProtocol(unittest.TestCase):
