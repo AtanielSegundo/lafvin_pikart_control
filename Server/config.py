@@ -99,7 +99,7 @@ class PositionGains:
 # stay in the Pi's GPIO-safe range -- the header pins are NOT 5 V tolerant.
 # ---------------------------------------------------------------------------
 ENCODER_PINS: Dict[str, Tuple[int, int]] = {
-    "M1": (0, 5),     # upper-left   (rewired to Pi GPIO, phys pins 29/31)
+    "M1": (25, 5),     # upper-left   (rewired to Pi GPIO, phys pins 29/31)
     "M2": (26, 20),   # lower-left
     "M3": (19, 16),   # lower-right
     "M4": (8, 7),     # upper-right  (rewired to Pi GPIO SPI0 pins; needs SPI off)
