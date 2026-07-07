@@ -274,9 +274,13 @@ class TestDriveControllerClosedLoop(unittest.TestCase):
         tel = self._run_until_move_done(ctrl, dt)
         enc = tel["encoders"]
         self.assertEqual(set(enc.keys()), {"M1", "M2", "M3", "M4"})
-        # In the (slip-free, correctly-signed) sim, all four counted forward.
+        # Telemetry exposes RAW counts; the raw sign depends on wiring
+        # (SideMapping.signs), so a forward move is verified on the POST-sign
+        # count -- robust to any per-motor sign calibration.
+        signs = CONFIG.sides.signs
         for tag, total in enc.items():
-            self.assertGreater(total, 0, f"{tag} did not count positive")
+            self.assertGreater(total * signs.get(tag, 1), 0,
+                               f"{tag} did not count forward")
 
 
 class TestProtocol(unittest.TestCase):
