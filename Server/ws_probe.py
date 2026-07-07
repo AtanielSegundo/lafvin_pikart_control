@@ -57,7 +57,7 @@ def main():
         print("handshake failed:", resp[:120]); return
     print("connected, reading telemetry...")
 
-    dur = float(sys.argv[1]) if len(sys.argv) > 1 else 6.0
+    dur = float(sys.argv[1]) if len(sys.argv) > 1 else 1000.0
     deadline = time.time() + dur
     last = None
     s.settimeout(6)

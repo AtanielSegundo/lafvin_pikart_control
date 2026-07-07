@@ -164,6 +164,39 @@ canvas.joystick {
   </div>
 </div>
 
+<!-- Drive targets & encoder-sign calibration -->
+<details class="extras" open>
+  <summary>Drive targets &amp; calibration</summary>
+  <div class="extras-inner" style="flex-direction:column;align-items:stretch;gap:10px;">
+
+    <!-- Straight distance target -->
+    <div class="slider-row" style="padding:0;">
+      <label style="min-width:64px;">Straight</label>
+      <input type="number" id="distInput" value="1.0" step="0.1"
+             style="flex:1;background:#16213e;color:#eee;border:1px solid #444;border-radius:6px;padding:8px;">
+      <span style="font-size:12px;color:#888;">m</span>
+      <div class="qbtn" onclick="sendDistance()">Go</div>
+    </div>
+
+    <!-- Target heading -->
+    <div class="slider-row" style="padding:0;">
+      <label style="min-width:64px;">Heading</label>
+      <input type="number" id="headInput" value="90" step="5"
+             style="flex:1;background:#16213e;color:#eee;border:1px solid #444;border-radius:6px;padding:8px;">
+      <span style="font-size:12px;color:#888;">&deg;</span>
+      <div class="qbtn" onclick="sendHeading()">Turn to</div>
+    </div>
+
+    <!-- Encoder signs + live raw counts -->
+    <div>
+      <div style="font-size:12px;color:#888;margin-bottom:6px;">
+        Encoder signs &mdash; push robot forward, flip any motor whose raw count goes &minus;</div>
+      <div id="signGrid" style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;"></div>
+    </div>
+
+  </div>
+</details>
+
 <!-- Servo controls -->
 <div class="servo-section">
   <div class="slider-row">
@@ -241,6 +274,13 @@ function handleTelemetry(raw) {
   setTxt('odoVL', (ws_.left ?? 0).toFixed(2));
   setTxt('odoVR', (ws_.right ?? 0).toFixed(2));
   setTxt('odoEng', d.engaged ? 'PID' : 'raw');
+
+  // Heading (for "turn to"), live raw counts, and current signs.
+  if (p.theta_deg != null) lastTheta = p.theta_deg;
+  const enc = d.encoders || {};
+  MOTORS.forEach(m => { const el = document.getElementById('raw' + m);
+                        if (el && enc[m] != null) el.textContent = enc[m]; });
+  if (msg.signs) { Object.assign(signs, msg.signs); updateSignBtns(); }
 }
 
 function send(cmd) {
@@ -517,6 +557,52 @@ function toggleBuzzer() {
   send('CMD_BUZZER#' + (buzzerOn ? '1' : '0'));
   document.getElementById('btnBuzz').classList.toggle('pressed', buzzerOn);
 }
+
+// --- Drive targets (straight distance + turn to heading) ---
+let lastTheta = 0;
+function sendDistance() {
+  const d = parseFloat(document.getElementById('distInput').value) || 0;
+  send(JSON.stringify({ type: 'drive_distance', distance: +d.toFixed(3) }));
+}
+function wrapDeg(a) { return ((a + 180) % 360 + 360) % 360 - 180; }
+function sendHeading() {
+  const target = parseFloat(document.getElementById('headInput').value) || 0;
+  const delta = wrapDeg(target - lastTheta);   // absolute heading -> relative turn
+  send(JSON.stringify({ type: 'turn', angle: +delta.toFixed(1) }));
+}
+
+// --- Encoder-sign calibration ---
+const MOTORS = ['M1', 'M2', 'M3', 'M4'];
+let signs = { M1: 1, M2: 1, M3: 1, M4: 1 };   // synced from telemetry
+function buildSignGrid() {
+  const grid = document.getElementById('signGrid');
+  if (!grid) return;
+  grid.innerHTML = '';
+  MOTORS.forEach(m => {
+    const cell = document.createElement('div');
+    cell.style.cssText = 'background:#16213e;border:1px solid #333;border-radius:6px;padding:6px;text-align:center;';
+    cell.innerHTML =
+      '<div style="font-size:12px;color:#aaa;">' + m + '</div>' +
+      '<div id="raw' + m + '" style="font-size:13px;color:#4cc9f0;">0</div>' +
+      '<div class="qbtn" id="sgn' + m + '" style="margin-top:4px;padding:6px;">+1</div>';
+    grid.appendChild(cell);
+    cell.querySelector('#sgn' + m).addEventListener('click', () => toggleSign(m));
+  });
+}
+function toggleSign(m) {
+  signs[m] = -signs[m];
+  send(JSON.stringify({ type: 'set_sign', motor: m, sign: signs[m] }));
+  updateSignBtns();
+}
+function updateSignBtns() {
+  MOTORS.forEach(m => {
+    const b = document.getElementById('sgn' + m);
+    if (b) { b.textContent = signs[m] > 0 ? '+1' : '-1';
+             b.classList.toggle('pressed', signs[m] < 0); }
+  });
+}
+buildSignGrid();
+updateSignBtns();
 
 // --- Battery poll ---
 setInterval(() => { send('CMD_POWER'); }, 5000);

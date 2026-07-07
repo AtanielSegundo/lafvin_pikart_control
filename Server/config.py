@@ -173,5 +173,5 @@ class RobotConfig:
     network: NetworkConfig = field(default_factory=NetworkConfig)
 
 
-# A ready-to-use default instance. Import and override fields as needed.
+# default instance
 CONFIG = RobotConfig()

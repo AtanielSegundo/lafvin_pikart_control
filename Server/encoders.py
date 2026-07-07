@@ -17,7 +17,7 @@ x4 decoding uses a transition table indexed by ``(prev_state << 2) | new`` with
     prev 10 :   -1,   0,   0,   1
     prev 11 :    0,   1,  -1,   0
 
-Off-Pi (no pigpio / no pigpiod), ``WheelEncoders`` transparently falls back to
+Off-Pi (no pigpio / no pigpiod), ``WheelEncoders`` transparently falls back to4{]/~´ÇKIJUH7Y6}
 ``SimulatedEncoder`` so the control stack still imports and the tests run.
 
 Requires the daemon:  sudo pigpiod

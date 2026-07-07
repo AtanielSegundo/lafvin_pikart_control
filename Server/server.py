@@ -104,6 +104,7 @@ class Server:
         r.register('drive_distance', self._h_drive_distance)
         r.register('turn',           self._h_turn)
         r.register('reset_odometry', self._h_reset_odometry)
+        r.register('set_sign',       self._h_set_sign)
         r.register('servo',          self._h_servo)
         r.register('led',            self._h_led)
         r.register('led_mode',       self._h_led_mode)
@@ -339,6 +340,7 @@ class Server:
             "battery": battery,
             "mode": self.Mode,
             "drive": self.drive.telemetry(),
+            "signs": dict(self.encoders.sides.signs),
         }
 
     def _stop_rotation(self):
@@ -427,6 +429,30 @@ class Server:
 
     def _h_reset_odometry(self, c: Command):
         self.drive.reset_odometry()
+
+    def _h_set_sign(self, c: Command):
+        """Flip encoder count sign(s) at runtime (calibration).
+
+        Mutates the live ``SideMapping.signs`` dict shared with the encoders,
+        so odometry picks up the change on the very next control tick.
+
+        JSON forms:
+          {"type":"set_sign","motor":"M3","sign":-1}
+          {"type":"set_sign","signs":{"M1":1,"M2":1,"M3":-1,"M4":-1}}
+        """
+        try:
+            signs = self.encoders.sides.signs
+            bulk = c.get('signs')
+            if isinstance(bulk, dict):
+                for tag, s in bulk.items():
+                    if tag in signs:
+                        signs[tag] = 1 if float(s) >= 0 else -1
+            else:
+                motor = str(c.get('motor', c.arg(0)))
+                if motor in signs:
+                    signs[motor] = 1 if c.num('sign', 1, 1) >= 0 else -1
+        except Exception:
+            pass
 
     def _h_mecanum(self, c: Command):
         """Legacy mecanum joystick mix (CMD_M_MOTOR)."""

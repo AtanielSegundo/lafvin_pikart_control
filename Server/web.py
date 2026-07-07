@@ -137,7 +137,8 @@ async def telemetry_broadcaster(app):
             continue
         tel = srv.get_telemetry()
         message = protocol.telemetry_message(
-            battery=tel['battery'], mode=tel['mode'], drive=tel['drive'])
+            battery=tel['battery'], mode=tel['mode'], drive=tel['drive'],
+            extra={'signs': tel.get('signs')})
         for ws in list(clients):
             if ws.closed:
                 clients.discard(ws)

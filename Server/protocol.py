@@ -34,6 +34,7 @@ ALIASES: Dict[str, str] = {
     "drive_distance": "drive_distance",     # closed-loop distance (new)
     "turn": "turn",                         # closed-loop in-place turn (new)
     "reset_odometry": "reset_odometry",     # (new)
+    "set_sign": "set_sign",                 # runtime encoder sign flip (new)
     # peripherals
     "CMD_SERVO": "servo", "servo": "servo",
     "CMD_LED": "led", "led": "led",
