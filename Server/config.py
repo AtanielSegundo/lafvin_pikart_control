@@ -101,7 +101,7 @@ class PositionGains:
 ENCODER_PINS: Dict[str, Tuple[int, int]] = {
     "M1": (25, 5),     # upper-left   (rewired to Pi GPIO, phys pins 29/31)
     "M2": (26, 20),   # lower-left
-    "M3": (19, 16),   # lower-right
+    "M3": (6, 12),    # lower-right  (moved off 19/16 — was under-counting)
     "M4": (8, 7),     # upper-right  (rewired to Pi GPIO SPI0 pins; needs SPI off)
 }
 
