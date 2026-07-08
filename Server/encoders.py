@@ -27,7 +27,7 @@ from __future__ import annotations
 import threading
 from typing import Dict, Iterable, List, Tuple
 
-from config import ENCODER_PINS, SideMapping
+from config import ENCODER_PINS, SideMapping, SINGLE_PHASE_ENCODERS
 
 try:  # pragma: no cover - hardware path
     import pigpio
@@ -54,15 +54,22 @@ HARDWARE_ENCODERS_CONNECTION = ENCODER_PINS
 class Encoder:
     """pigpio-driven quadrature decoder for a single motor."""
 
-    def __init__(self, pi, pin_phase_a: int, pin_phase_b: int, name: str = ""):
+    def __init__(self, pi, pin_phase_a: int, pin_phase_b: int, name: str = "",
+                 single_phase: bool = False):
         self.pi = pi
         self.phase_a = pin_phase_a
         self.phase_b = pin_phase_b
         self.name = name
+        # single_phase: phase B is unusable, so decode on phase A alone. Counts
+        # unsigned MAGNITUDE (x2); direction + x2 scaling are applied by
+        # WheelEncoders using a same-side partner. See SINGLE_PHASE_ENCODERS.
+        self.single_phase = single_phase
 
         self._count = 0        # delta accumulator, reset every control step
         self._total = 0        # lifetime counter, never auto-reset (diagnostics)
         self._state = 0
+        self._a = 0            # cached phase levels (updated from callbacks;
+        self._b = 0            #   avoids a socket read per edge)
         self._lock = threading.Lock()
         self._cb_a = None
         self._cb_b = None
@@ -74,13 +81,21 @@ class Encoder:
         if self._listening:
             return
         pi = self.pi
-        for pin in (self.phase_a, self.phase_b):
+        pins = (self.phase_a,) if self.single_phase else (self.phase_a, self.phase_b)
+        for pin in pins:
             pi.set_mode(pin, pigpio.INPUT)
             pi.set_pull_up_down(pin, pigpio.PUD_UP)
             pi.set_glitch_filter(pin, GLITCH_FILTER_US)
-        self._state = (pi.read(self.phase_a) << 1) | pi.read(self.phase_b)
-        self._cb_a = pi.callback(self.phase_a, pigpio.EITHER_EDGE, self._pulse)
-        self._cb_b = pi.callback(self.phase_b, pigpio.EITHER_EDGE, self._pulse)
+        if self.single_phase:
+            # One callback on phase A; every edge is one magnitude tick.
+            self._cb_a = pi.callback(self.phase_a, pigpio.EITHER_EDGE,
+                                     self._pulse_single)
+        else:
+            self._a = pi.read(self.phase_a)
+            self._b = pi.read(self.phase_b)
+            self._state = (self._a << 1) | self._b
+            self._cb_a = pi.callback(self.phase_a, pigpio.EITHER_EDGE, self._pulse)
+            self._cb_b = pi.callback(self.phase_b, pigpio.EITHER_EDGE, self._pulse)
         self._listening = True
 
     def stop(self) -> None:
@@ -95,9 +110,24 @@ class Encoder:
 
     # -- decoding ----------------------------------------------------------
     def _pulse(self, gpio, level, tick) -> None:
-        a = self.pi.read(self.phase_a)
-        b = self.pi.read(self.phase_b)
-        self._apply_state((a << 1) | b)
+        # `level` is the new level of the pin that changed (0/1; 2 = watchdog).
+        # Use it directly instead of two socket reads per edge -- those reads
+        # made the callback so slow that the daemon dropped edges at speed.
+        if level > 1:
+            return
+        if gpio == self.phase_a:
+            self._a = level
+        else:
+            self._b = level
+        self._apply_state((self._a << 1) | self._b)
+
+    def _pulse_single(self, gpio, level, tick) -> None:
+        """Single-phase (phase-A-only) tick: count unsigned magnitude."""
+        if level > 1:
+            return
+        with self._lock:
+            self._count += 1
+            self._total += 1
 
     def _apply_state(self, new_state: int) -> None:
         """Advance the counter given the freshly-read 2-bit phase state.
@@ -145,8 +175,10 @@ class SimulatedEncoder(Encoder):
     or :meth:`feed_states` (a sequence of raw 2-bit A/B states).
     """
 
-    def __init__(self, pin_phase_a: int = 0, pin_phase_b: int = 0, name: str = ""):
-        super().__init__(None, pin_phase_a, pin_phase_b, name)
+    def __init__(self, pin_phase_a: int = 0, pin_phase_b: int = 0, name: str = "",
+                 single_phase: bool = False):
+        super().__init__(None, pin_phase_a, pin_phase_b, name,
+                         single_phase=single_phase)
 
     def begin(self) -> None:  # no hardware
         self._listening = True
@@ -175,11 +207,21 @@ class WheelEncoders:
     def __init__(self, sides: SideMapping,
                  pins: Dict[str, Tuple[int, int]] = ENCODER_PINS,
                  encoders: Dict[str, Encoder] | None = None,
-                 pi=None):
+                 pi=None,
+                 modes: Dict[str, dict] | None = None):
         self.sides = sides
         self._pi = pi
         self._owns_pi = False
         self.using_hardware = False
+        # Per-motor degraded-decode config (single phase). Defaults to the
+        # project config when we build the encoders ourselves; empty when
+        # encoders are injected (tests opt in explicitly via `modes`).
+        if modes is not None:
+            self.modes = modes
+        elif encoders is None:
+            self.modes = dict(SINGLE_PHASE_ENCODERS)
+        else:
+            self.modes = {}
         if encoders is not None:
             self.encoders = encoders
         else:
@@ -194,13 +236,15 @@ class WheelEncoders:
             self._pi = pi
             if pi is not None and pi.connected:
                 self.using_hardware = True
-                return {tag: Encoder(pi, a, b, name=tag)
+                return {tag: Encoder(pi, a, b, name=tag,
+                                     single_phase=tag in self.modes)
                         for tag, (a, b) in pins.items()}
             print("[encoders] pigpiod not reachable; using simulated encoders. "
                   "Start it with:  sudo pigpiod")
         else:
             print("[encoders] pigpio not installed; using simulated encoders.")
-        return {tag: SimulatedEncoder(a, b, name=tag)
+        return {tag: SimulatedEncoder(a, b, name=tag,
+                                      single_phase=tag in self.modes)
                 for tag, (a, b) in pins.items()}
 
     # -- lifecycle ---------------------------------------------------------
@@ -232,28 +276,42 @@ class WheelEncoders:
         truth for calibrating signs and counts_per_rev."""
         return {tag: enc.total for tag, enc in self.encoders.items()}
 
-    def signed_totals(self) -> Dict[str, int]:
-        """Lifetime counts per motor tag with the configured sign applied."""
-        return {tag: enc.total * self.sides.signs.get(tag, 1)
-                for tag, enc in self.encoders.items()}
+    def signed_totals(self) -> Dict[str, float]:
+        """Lifetime counts per motor tag, sign/scale corrected (single-phase
+        motors resolved against their partner)."""
+        totals = {tag: enc.total for tag, enc in self.encoders.items()}
+        return {tag: self._resolve(tag, totals) for tag in self.encoders}
 
     # -- aggregation -------------------------------------------------------
-    def _signed_count(self, tag: str) -> int:
-        return self.encoders[tag].count * self.sides.signs.get(tag, 1)
+    def _resolve(self, tag: str, raw: Dict[str, float]) -> float:
+        """Turn a raw per-motor count into a sign/scale-corrected count.
+
+        Normal motors: raw * sign. Single-phase motors: unsigned magnitude,
+        scaled to the x4 tick base, with direction borrowed from the healthy
+        same-side partner (a lone phase can't sense rotation direction).
+        """
+        mode = self.modes.get(tag)
+        if mode:
+            partner = mode.get("direction_from")
+            scale = mode.get("scale", 1.0)
+            partner_signed = raw.get(partner, 0) * self.sides.signs.get(partner, 1)
+            direction = 1 if partner_signed >= 0 else -1
+            return abs(raw[tag]) * scale * direction
+        return raw[tag] * self.sides.signs.get(tag, 1)
 
     def side_counts(self) -> Tuple[float, float]:
         """Current sign-corrected mean count for (left, right)."""
-        left = _mean(self._signed_count(t) for t in self.sides.left)
-        right = _mean(self._signed_count(t) for t in self.sides.right)
+        counts = {tag: enc.count for tag, enc in self.encoders.items()}
+        left = _mean(self._resolve(t, counts) for t in self.sides.left)
+        right = _mean(self._resolve(t, counts) for t in self.sides.right)
         return left, right
 
     def read_reset_sides(self) -> Tuple[float, float]:
         """Return (left, right) mean count deltas since the last call and
         reset every encoder."""
-        left = _mean(self.encoders[t].read_reset() * self.sides.signs.get(t, 1)
-                     for t in self.sides.left)
-        right = _mean(self.encoders[t].read_reset() * self.sides.signs.get(t, 1)
-                      for t in self.sides.right)
+        raw = {tag: enc.read_reset() for tag, enc in self.encoders.items()}
+        left = _mean(self._resolve(t, raw) for t in self.sides.left)
+        right = _mean(self._resolve(t, raw) for t in self.sides.right)
         return left, right
 
 

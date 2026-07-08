@@ -162,6 +162,25 @@ class TestEncoders(unittest.TestCase):
         self.assertAlmostEqual(right2, 80.0)
         self.assertEqual(wheels.side_counts(), (0.0, 0.0))
 
+    def test_single_phase_encoder_borrows_direction_and_scale(self):
+        # M3 decodes on phase A only: stores unsigned magnitude, gets its x2
+        # scale and direction from its healthy same-side partner M4.
+        sides = SideMapping(signs={"M1": 1, "M2": 1, "M3": -1, "M4": -1})
+        modes = {"M3": {"direction_from": "M4", "scale": 2.0}}
+        encs = {t: SimulatedEncoder(0, 0, name=t) for t in ("M1", "M2", "M3", "M4")}
+        wheels = WheelEncoders(sides, encoders=encs, modes=modes)
+
+        # Forward: M4 raw -40 (sign -1 -> +40). M3 magnitude 50 -> 50*2*(+1)=100.
+        encs["M3"].add(50); encs["M4"].add(-40)
+        _, right = wheels.side_counts()
+        self.assertAlmostEqual(right, (100.0 + 40.0) / 2.0)   # 70
+
+        # Reverse: M4 raw +40 (sign -1 -> -40) flips M3's borrowed direction.
+        wheels.read_reset_sides()
+        encs["M3"].add(50); encs["M4"].add(40)
+        _, right_rev = wheels.side_counts()
+        self.assertAlmostEqual(right_rev, (-100.0 - 40.0) / 2.0)  # -70
+
 
 class _RecordingMotor:
     """Stand-in for Motor.setMotorModel that records the last duties."""

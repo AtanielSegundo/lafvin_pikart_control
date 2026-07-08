@@ -381,8 +381,17 @@ class SimulatedDrivePlant:
 
     def _inject(self, tags, counts: float) -> None:
         signs = self.config.sides.signs
+        modes = getattr(self.encoders, "modes", {})
         for tag in tags:
             enc = self.encoders.encoders[tag]
-            # read_reset_sides multiplies by sign, so pre-divide to land on the
-            # intended post-sign value.
-            enc.add(int(round(counts * signs.get(tag, 1))))
+            mode = modes.get(tag)
+            if mode:
+                # Single-phase: the encoder stores unsigned magnitude and the
+                # read path re-applies direction (from partner) and scale, so
+                # pre-divide by scale to land on the intended value.
+                scale = mode.get("scale", 1.0)
+                enc.add(int(round(abs(counts) / scale)))
+            else:
+                # read_reset_sides multiplies by sign, so pre-divide to land on
+                # the intended post-sign value.
+                enc.add(int(round(counts * signs.get(tag, 1))))

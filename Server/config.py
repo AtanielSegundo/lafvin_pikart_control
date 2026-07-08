@@ -105,6 +105,23 @@ ENCODER_PINS: Dict[str, Tuple[int, int]] = {
     "M4": (8, 7),     # upper-right  (rewired to Pi GPIO SPI0 pins; needs SPI off)
 }
 
+# ---------------------------------------------------------------------------
+# Single-phase (degraded) encoders.
+#
+# M3's phase-B line (GPIO 12) is physically dropping ~40% of its edges and can't
+# be repaired, so full quadrature under-counts and fabricates a fake heading.
+# We therefore decode M3 on phase A ALONE:
+#   * phase A gives clean magnitude but HALF the ticks/rev (x2 = 1170), so its
+#     count is scaled x2 to match the x4 (2340) motors when aggregating a side;
+#   * a single phase can't tell rotation direction, so it's borrowed from the
+#     same-side partner (M4), which is healthy and always turns the same way.
+# The raw per-motor count stays the honest phase-A tick count (NOT scaled); the
+# x2 only applies inside the side aggregation / distance conversion.
+#   tag -> {"direction_from": partner_tag, "scale": float}
+SINGLE_PHASE_ENCODERS: Dict[str, dict] = {
+    "M3": {"direction_from": "M4", "scale": 2.0},
+}
+
 # Which motor tags belong to which side, and the sign of their counts so that
 # "forward" produces positive counts on both sides.
 #
