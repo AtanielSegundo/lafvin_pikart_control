@@ -68,13 +68,24 @@ class PIDGains:
 @dataclass(frozen=True)
 class PositionGains:
     kp: float = 12000.0      # duty per metre of error
-    ki: float = 0.0
+    ki: float = 3000.0       # gentle backstop for residual error; its
+                             # contribution is bounded by integral_limit below
     kd: float = 1500.0       # duty per (m/s) — damping
     output_limit: float = 1800.0     # gentle duty cap during moves
     integral_limit: float = 800.0
     tolerance: float = 0.01          # m, arrival tolerance
     stop_speed: float = 0.03         # m/s below which we consider it stopped
     max_time: float = 20.0           # s, safety timeout per move
+    # Stiction / deadband floor: while a side has NOT arrived, don't let its
+    # command sit below this magnitude, or the PID output (kp*error) decays
+    # below the motor's move threshold near the target and the wheel stalls
+    # short, humming, until max_time. Set to the lowest PWM that reliably
+    # starts a wheel from rest (measure it: ramp one wheel until it moves).
+    # 0 disables it. Sign is preserved, so reverse moves still get -min_move.
+    # Starting point (~600 stalled, so the threshold is just above it); keep it
+    # as LOW as still moves the wheel -- too high makes it creep fast and hunt
+    # around the target instead of settling. TUNE on hardware.
+    min_move_duty: float = 750.0
 
 
 # ---------------------------------------------------------------------------

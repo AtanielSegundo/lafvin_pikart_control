@@ -37,6 +37,22 @@ def _clamp(value: float, limit: float) -> float:
     return max(-limit, min(limit, value))
 
 
+def _stiction_floor(duty: float, remaining: float, gains) -> float:
+    """Keep a not-yet-arrived position command above the motor's move threshold.
+
+    The position PID output is ~kp*error, so it shrinks as the wheel nears its
+    target and eventually falls below the PWM the motor needs to move at all --
+    the wheel then stalls a few mm short and hums until the safety timeout.
+    While the side is still outside `tolerance`, floor the magnitude at
+    `min_move_duty` (sign preserved, so reverse moves get -min_move_duty).
+    """
+    if gains.min_move_duty <= 0 or duty == 0.0:
+        return duty
+    if abs(remaining) <= gains.tolerance:
+        return duty
+    return math.copysign(max(abs(duty), gains.min_move_duty), duty)
+
+
 class DriveController:
     def __init__(self, motor, encoders, config: RobotConfig = CONFIG,
                  clock: Callable[[], float] = time.monotonic,
@@ -187,6 +203,11 @@ class DriveController:
                                              move.traveled_left, dt)
             duty_right = self.pos_right.update(move.target_right,
                                                move.traveled_right, dt)
+            err_l, err_r = move.errors()
+            # Deadband/stiction compensation so a nearly-arrived side doesn't
+            # stall short below the motor's move threshold.
+            duty_left = _stiction_floor(duty_left, err_l, self.config.position)
+            duty_right = _stiction_floor(duty_right, err_r, self.config.position)
             if move.is_done(measured.left, measured.right):
                 duty_left = duty_right = 0.0
                 self.pos_left.reset()
@@ -196,7 +217,6 @@ class DriveController:
                         self._move = None
                 move = None                       # reflect completion in telemetry
             else:
-                err_l, err_r = move.errors()
                 move_info = {
                     "target": {"left": round(move.target_left, 4),
                                "right": round(move.target_right, 4)},
