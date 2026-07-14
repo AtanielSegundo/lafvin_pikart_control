@@ -68,7 +68,7 @@ class PIDGains:
 @dataclass(frozen=True)
 class PositionGains:
     kp: float = 10000.0      # duty per metre of error
-    ki: float = 0.0       # gentle backstop for residual error; its
+    ki: float = 1000.0       # gentle backstop for residual error; its
                              # contribution is bounded by integral_limit below
     kd: float = 2000.0       # duty per (m/s) — damping
     output_limit: float = 2400.0     # gentle duty cap during moves
@@ -82,10 +82,7 @@ class PositionGains:
     # short, humming, until max_time. Set to the lowest PWM that reliably
     # starts a wheel from rest (measure it: ramp one wheel until it moves).
     # 0 disables it. Sign is preserved, so reverse moves still get -min_move.
-    # Starting point (~600 stalled, so the threshold is just above it); keep it
-    # as LOW as still moves the wheel -- too high makes it creep fast and hunt
-    # around the target instead of settling. TUNE on hardware.
-    min_move_duty: float = 1200.0
+    min_move_duty: float = 1000.0
 
 
 # ---------------------------------------------------------------------------
