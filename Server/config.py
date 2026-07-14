@@ -85,7 +85,7 @@ class PositionGains:
     # Starting point (~600 stalled, so the threshold is just above it); keep it
     # as LOW as still moves the wheel -- too high makes it creep fast and hunt
     # around the target instead of settling. TUNE on hardware.
-    min_move_duty: float = 750.0
+    min_move_duty: float = 1200.0
 
 
 # ---------------------------------------------------------------------------
