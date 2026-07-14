@@ -24,8 +24,8 @@ from typing import Dict, Tuple
 @dataclass(frozen=True)
 class WheelGeometry:
     diameter: float = 0.065           # m
-    colinear_distance: float = 0.12   # m, between motors on the same axle
-    track: float = 0.151              # m, distance between left and right sides
+    colinear_distance: float = 0.095   # m, between motors on the same axle
+    track: float = 0.16              # m, distance between left and right sides
     counts_per_rev: int = 2340        
                                       # (quadrature x4). CALIBRATE for your build.
 
@@ -174,7 +174,7 @@ MOTOR_CHANNELS = {
 @dataclass(frozen=True)
 class ControlConfig:
     loop_hz: float = 20.0             # closed-loop update rate
-    telemetry_hz: float = 50.0        # rate telemetry is pushed to clients
+    telemetry_hz: float = 200.0       # rate telemetry is pushed to clients
     command_timeout: float = 0.1      # s; stop motors if no drive cmd arrives
     max_linear: float = 0.6           # m/s, saturates drive commands
     max_angular: float = 4.0          # rad/s
