@@ -25,7 +25,7 @@ from typing import Dict, Tuple
 class WheelGeometry:
     diameter: float = 0.065           # m
     colinear_distance: float = 0.095   # m, between motors on the same axle
-    track: float = 0.16              # m, distance between left and right sides
+    track: float = 2*0.16              # m, distance between left and right sides
     counts_per_rev: int = 2340        
                                       # (quadrature x4). CALIBRATE for your build.
 
@@ -67,11 +67,11 @@ class PIDGains:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class PositionGains:
-    kp: float = 10000.0      # duty per metre of error
-    ki: float = 1000.0       # gentle backstop for residual error; its
+    kp: float = 12000.0      # duty per metre of error
+    ki: float = 2000.0       # gentle backstop for residual error; its
                              # contribution is bounded by integral_limit below
-    kd: float = 2000.0       # duty per (m/s) — damping
-    output_limit: float = 2400.0     # gentle duty cap during moves
+    kd: float = 1000.0       # duty per (m/s) — damping
+    output_limit: float = 2000.0     # gentle duty cap during moves
     integral_limit: float = 800.0
     tolerance: float = 0.01          # m, arrival tolerance
     stop_speed: float = 0.03         # m/s below which we consider it stopped
