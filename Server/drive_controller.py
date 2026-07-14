@@ -145,7 +145,7 @@ class DriveController:
         with s_left = -s, s_right = +s, so each side must travel
         s = a * track / 2 in opposite directions.
         """
-        s = math.radians(angle_deg) * self.config.wheel.track / 2.0
+        s = math.radians(angle_deg) * self.config.wheel.track # / 2.0
         self._start_move(-s, s)
 
     def _start_move(self, target_left: float, target_right: float) -> None:
