@@ -442,7 +442,7 @@ class Joystick {
 }
 
 // Robot velocity limits (mirror ControlConfig in config.py).
-const MAX_LINEAR = 0.6;    // m/s
+const MAX_LINEAR = 1.0;    // m/s
 const MAX_ANGULAR = 4.0;   // rad/s
 
 // Movement command throttle. Store angle + magnitude (0..1) per joystick.
@@ -528,7 +528,7 @@ const panSlider = document.getElementById('panSlider');
 const tiltSlider = document.getElementById('tiltSlider');
 panSlider.oninput = () => {
   document.getElementById('panVal').textContent = panSlider.value;
-  send('CMD_SERVO#0#' + panSlider.value);
+  send('CMD_SERVO#5#' + panSlider.value);
 };
 tiltSlider.oninput = () => {
   document.getElementById('tiltVal').textContent = tiltSlider.value;

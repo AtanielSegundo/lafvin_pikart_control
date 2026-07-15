@@ -30,8 +30,8 @@ class Servo:
         #     self.PwmServo.setServoPulse(11, 500 + int((angle + error) / 0.09))
         # elif channel == '4':
         #     self.PwmServo.setServoPulse(12, 500 + int((angle + error) / 0.09))
-        # elif channel == '5':
-        #     self.PwmServo.setServoPulse(13, 500 + int((angle + error) / 0.09))
+        elif channel == '5':
+            self.PwmServo.setServoPulse(13, 500 + int((angle + error) / 0.09))
         
         elif channel == '6':
             self.PwmServo.setServoPulse(14, 500 + int((angle + error) / 0.09))
