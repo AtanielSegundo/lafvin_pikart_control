@@ -10,13 +10,14 @@ class Ultrasonic:
         GPIO.setwarnings(False)
         self.trigger_pin = 27
         self.echo_pin = 22
-        self.MAX_DISTANCE = 300  # define the maximum measuring distance, unit: cm
+        self.MAX_DISTANCE = 300  # unit: cm
         self.timeOut = self.MAX_DISTANCE * 60  # calculate timeout according to the maximum measuring distance
         GPIO.setmode(GPIO.BCM)
         GPIO.setup(self.trigger_pin, GPIO.OUT)
         GPIO.setup(self.echo_pin, GPIO.IN)
 
-    def pulseIn(self, pin, level, timeOut):  # obtain pulse time of a pin under timeOut
+    # obtain pulse time of a pin under timeOut
+    def pulseIn(self, pin, level, timeOut):  
         t0 = time.time()
         while (GPIO.input(pin) != level):
             if ((time.time() - t0) > timeOut * 0.000001):
@@ -73,7 +74,7 @@ class Ultrasonic:
 
 
 ultrasonic = Ultrasonic()
-# Main program logic follows:
+
 if __name__ == '__main__':
     print('Program is starting ... ')
     try:

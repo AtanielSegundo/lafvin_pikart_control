@@ -75,7 +75,7 @@ class PositionGains:
     integral_limit: float = 800.0
     tolerance: float = 0.01          # m, arrival tolerance
     stop_speed: float = 0.03         # m/s below which we consider it stopped
-    max_time: float = 20.0           # s, safety timeout per move
+    max_time: float = 12.0           # s, safety timeout per move
     # Stiction / deadband floor: while a side has NOT arrived, don't let its
     # command sit below this magnitude, or the PID output (kp*error) decays
     # below the motor's move threshold near the target and the wheel stalls
@@ -190,12 +190,12 @@ class NetworkConfig:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class RobotConfig:
-    wheel: WheelGeometry = field(default_factory=WheelGeometry)
-    pid: PIDGains = field(default_factory=PIDGains)
+    wheel   : WheelGeometry = field(default_factory=WheelGeometry)
+    pid     : PIDGains      = field(default_factory=PIDGains)
     position: PositionGains = field(default_factory=PositionGains)
-    sides: SideMapping = field(default_factory=SideMapping)
-    control: ControlConfig = field(default_factory=ControlConfig)
-    network: NetworkConfig = field(default_factory=NetworkConfig)
+    sides   : SideMapping   = field(default_factory=SideMapping)
+    control : ControlConfig = field(default_factory=ControlConfig)
+    network : NetworkConfig = field(default_factory=NetworkConfig)
 
 
 # default instance

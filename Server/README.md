@@ -89,9 +89,8 @@ any machine — no Pi required.
 
 ---
 
-## Encoder → Odometry → PID (the skid-steer model)
+## Encoder → Odometry → PID
 
-The kinematics mirror the CoppeliaSim `DiffDrive` reference used for analysis.
 The two left wheels move as one virtual left wheel, the two right wheels as one
 virtual right wheel, so the platform is a differential drive with track width
 equal to the lateral spacing between sides.
@@ -114,10 +113,10 @@ are counted (x4). The transition delta is looked up by
    prev 11:     0,   1,  -1,   0
 ```
 
-Counting is serviced by the **pigpio daemon (pigpiod)** in C, not by Python
-callbacks. This matters: at 2340 counts/rev (13 PPR × 45:1 × 4) the edge rate
-at speed is far too high for RPi.GPIO's Python callbacks, which silently drop
-edges and under-count. Each phase gets a 100 µs hardware glitch filter for
+Counting is serviced by the **pigpio daemon (pigpiod)** in C. 
+This matters: at 2340 counts/rev (13 PPR × 45:1 × 4) the edge rate
+at speed is far too high for RPi.GPIO's Python callbacks, which silently under-count. 
+Each phase gets a 100 µs hardware glitch filter for
 debounce. Off-Pi (no pigpio/pigpiod), `WheelEncoders` falls back to
 `SimulatedEncoder` so the stack still imports and the tests run.
 
@@ -148,7 +147,7 @@ v_left  = v − w · track/2
 v_right = v + w · track/2
 ```
 
-**Two control modes** (`drive_controller.py`), once per control tick (50 Hz):
+**Two control modes** (`drive_controller.py`), once per control tick :
 
 *Velocity mode* (teleop / `drive`): inverse-kinematics the target `Twist` →
 per-side target speed → per-side velocity `PID` (+feed-forward) → duty.

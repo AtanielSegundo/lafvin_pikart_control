@@ -4,20 +4,28 @@ Skid-steer odometry: integrate wheel encoder deltas into a planar pose.
 
 This is the direct counterpart of the CoppeliaSim ``DiffDrive.step`` used for
 the analysis. There the pose is *driven* from commanded wheel speeds; here we
-*estimate* the pose from *measured* wheel travel reported by the encoders, but
-the update equations are identical:
-
-    v = (v_right + v_left) / 2
-    w = (v_right - v_left) / track
-    theta += w * dt
-    x += v * cos(theta) * dt
-    y += v * sin(theta) * dt
+*estimate* the pose from *measured* wheel travel reported by the encoders.
 
 We integrate from per-side distance deltas (metres) so the result is
 independent of the loop timing jitter:
 
     d_center = (d_right + d_left) / 2
     d_theta  = (d_right - d_left) / track
+
+Each step is modelled as a constant-curvature arc about the ICC (Instantaneous
+Center of Curvature) and integrated in EXACT closed form (Dudek & Jenkin,
+Computational Principles of Mobile Robotics, eq. 4-5):
+
+    R = d_center / d_theta                 # signed turn radius
+    x += R * (sin(theta + d_theta) - sin(theta))
+    y += R * (cos(theta) - cos(theta + d_theta))
+    theta += d_theta
+
+When d_theta -> 0 the ICC goes to infinity (R = 0/0), so the straight-line
+limit is used instead (x += d_center*cos(theta), y += d_center*sin(theta)).
+This is strictly more accurate than the midpoint-heading chord approximation on
+curved paths -- it closes constant-curvature arcs exactly -- and degenerates to
+the same result for the tiny per-step angles seen in straight driving.
 
 Heading is kept wrapped to (-pi, pi].
 """
@@ -70,17 +78,24 @@ class SkidSteerOdometry:
                               dt: float) -> Pose:
         """Advance the pose given per-side distances travelled (metres).
 
-        Uses the midpoint heading (2nd-order) for a more accurate arc estimate
-        than sampling theta at the start of the step.
+        Integrates the step as an exact constant-curvature arc about the ICC
+        (Dudek & Jenkin eq. 4-5), falling back to the straight-line limit as
+        d_theta -> 0 to avoid the R = d_center / d_theta singularity.
         """
         d_center = (d_right + d_left) / 2.0
         d_theta = (d_right - d_left) / self.track
+        theta = self.pose.theta
 
-        # Integrate position at the midpoint heading of the step.
-        mid_theta = self.pose.theta + d_theta / 2.0
-        self.pose.x += d_center * math.cos(mid_theta)
-        self.pose.y += d_center * math.sin(mid_theta)
-        self.pose.theta = wrap_angle(self.pose.theta + d_theta)
+        if abs(d_theta) < 1e-9:
+            # Straight-line limit: ICC at infinity, R = d_center/d_theta is 0/0.
+            self.pose.x += d_center * math.cos(theta)
+            self.pose.y += d_center * math.sin(theta)
+        else:
+            # Exact arc about the ICC: rotate about the (signed) turn radius R.
+            R = d_center / d_theta
+            self.pose.x += R * (math.sin(theta + d_theta) - math.sin(theta))
+            self.pose.y += R * (math.cos(theta) - math.cos(theta + d_theta))
+        self.pose.theta = wrap_angle(theta + d_theta)
 
         if dt > 0.0:
             self.linear_velocity = d_center / dt
