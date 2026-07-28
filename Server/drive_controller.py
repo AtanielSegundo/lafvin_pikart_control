@@ -103,8 +103,8 @@ class DriveController:
         self._thread      : Optional[threading.Thread] = None
         self._stop_evt = threading.Event()
         
-        self.dist_arr = deque(maxlen=2)
-        self.front_distance_cm = None       # latest front reading, for telemetry
+        self.dist_arr = deque(maxlen=5)     # recent VALID readings (median filter)
+        self.front_distance_cm = None       # median front distance, for telemetry
         self._dist_thread: Optional[threading.Thread] = None
         self._dist_stop_evt = threading.Event()
         self.dist_guard_lock = threading.Lock()
@@ -350,30 +350,36 @@ class DriveController:
                 self._stop_evt.wait(sleep)
 
     # This thread guards the physical front of the Kart: it holds
-    # dist_guard_lock while an obstacle is close AND closing, and step() reads
-    # that state (via _front_blocked) to veto forward motion.
+    # dist_guard_lock while an obstacle is closer than the limit, and step()
+    # reads that state (via _front_blocked) to veto forward motion.
     def _dist_guard(self) -> None:
         period = 1.0 / (2 * self.config.control.loop_hz)
+        limit = self.config.control.minimum_front_distance_cm
+        hysteresis = 5          # cm release margin, so jitter doesn't chatter
 
         while not self._dist_stop_evt.is_set():
             now = self._clock()
 
-            f_dist_now = self.dist_sensor.get_distance()
-            self.dist_arr.append(f_dist_now)
-            self.front_distance_cm = f_dist_now     # publish for telemetry/UI
+            raw = self.dist_sensor.get_distance()
+            # get_distance() returns 255 when >=3 of its 5 pings time out -- a
+            # FAILED read, not a real "far" measurement. Those spikes were
+            # flipping the guard off, so drop them and median-filter what's left.
+            if raw is not None and 0 < raw < 255:
+                self.dist_arr.append(raw)
+            if self.dist_arr:
+                s = sorted(self.dist_arr)
+                self.front_distance_cm = int(s[len(s) // 2])   # median, for UI
 
-            below_limit = f_dist_now < self.config.control.minimum_front_distance_cm
-            closing = (len(self.dist_arr) == 2
-                       and (self.dist_arr[1] - self.dist_arr[0]) < 0)
-            
-            # dist_guard_lock is a plain (non-reentrant) Lock used as a flag:
-            # only this thread touches it, so guard acquire/release with
-            # locked() to avoid a self-deadlock on a repeated acquire.
-            if below_limit and closing:
-                if not self.dist_guard_lock.locked():
+            # dist_guard_lock is a plain (non-reentrant) Lock used as a flag;
+            # only this thread touches it. Engage below the limit, release only
+            # past limit+hysteresis. Direction is handled by the forward-only
+            # veto in _front_blocked, so we gate purely on proximity here.
+            f = self.front_distance_cm
+            if f is not None:
+                if f < limit and not self.dist_guard_lock.locked():
                     self.dist_guard_lock.acquire()
-            elif self.dist_guard_lock.locked():
-                self.dist_guard_lock.release()
+                elif f > limit + hysteresis and self.dist_guard_lock.locked():
+                    self.dist_guard_lock.release()
 
             sleep = period - (self._clock() - now)
 
