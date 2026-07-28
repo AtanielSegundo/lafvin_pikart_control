@@ -104,6 +104,7 @@ class DriveController:
         self._stop_evt = threading.Event()
         
         self.dist_arr = deque(maxlen=2)
+        self.front_distance_cm = None       # latest front reading, for telemetry
         self._dist_thread: Optional[threading.Thread] = None
         self._dist_stop_evt = threading.Event()
         self.dist_guard_lock = threading.Lock()
@@ -319,6 +320,7 @@ class DriveController:
             "duty": {"left": int(round(duty_left)), "right": int(round(duty_right))},
             "engaged": engaged,
             "guard_blocked": guard_blocked,
+            "front_distance_cm": self.front_distance_cm,
             "goal_active": move is not None,
             "move": move_info,
             "encoders": self.encoders.raw_totals(),   # raw per-motor counts
@@ -358,6 +360,7 @@ class DriveController:
 
             f_dist_now = self.dist_sensor.get_distance()
             self.dist_arr.append(f_dist_now)
+            self.front_distance_cm = f_dist_now     # publish for telemetry/UI
 
             below_limit = f_dist_now < self.config.control.minimum_front_distance_cm
             closing = (len(self.dist_arr) == 2
@@ -424,6 +427,7 @@ class DriveController:
             "duty": {"left": 0, "right": 0},
             "engaged": False,
             "guard_blocked": False,
+            "front_distance_cm": None,
             "goal_active": False,
             "move": None,
             "encoders": {},
