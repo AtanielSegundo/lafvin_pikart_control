@@ -146,9 +146,7 @@ canvas.joystick {
 
 <!-- Drive mode + odometry telemetry -->
 <div class="slider-row" style="justify-content:space-between;">
-  <label style="min-width:auto;">
-    <input type="checkbox" id="pidToggle"> Closed-loop (PID)
-  </label>
+  <label style="min-width:auto;color:#4cc9f0;">Closed-loop drive (always on)</label>
   <div class="qbtn" onclick="send(JSON.stringify({type:'reset_odometry'}))">Reset odom</div>
 </div>
 <div class="section" style="padding:4px 12px;">
@@ -441,63 +439,77 @@ class Joystick {
   }
 }
 
-// Robot velocity limits (mirror ControlConfig in config.py).
+// Robot velocity limits (mirror ControlConfig in config.py). The drive
+// controller clamps again server-side, so these are just the UI's full-scale.
 const MAX_LINEAR = 1.0;    // m/s
 const MAX_ANGULAR = 4.0;   // rad/s
 
-// Movement command throttle. Store angle + magnitude (0..1) per joystick.
+// EVERY motion input (joysticks, rotation buttons, keyboard) is turned into a
+// body twist and sent as {type:'drive', ...}, so the DriveController's PID
+// always owns the motors. We never emit CMD_MOTOR / CMD_M_MOTOR -- no raw
+// open-loop drive.
 let moveAngle = 0, moveNorm = 0, rotAngle = 0, rotNorm = 0;
-let moveActive = false, rotActive = false;
+let moveActive = false, rotActive = false;   // joysticks
+let btnRot = 0;                              // held rotation buttons: -1 CW, +1 CCW
+let keyLinear = 0, keyAngular = 0;           // keyboard: -1 / 0 / +1 each
 
-const pidToggle = document.getElementById('pidToggle');
-const pidOn = () => pidToggle.checked;
+const clampUnit = v => Math.max(-1, Math.min(1, v));
 
 const moveJoy = new Joystick('moveJoy',
   (angle, norm) => { moveAngle = angle; moveNorm = norm; moveActive = true; },
-  () => { moveActive = false; moveNorm = 0; sendMotor(); }
+  () => { moveActive = false; moveNorm = 0; tickDrive(); }
 );
 
 const rotJoy = new Joystick('rotJoy',
   (angle, norm) => { rotAngle = angle; rotNorm = norm; rotActive = true; },
-  () => { rotActive = false; rotNorm = 0; sendMotor(); }
+  () => { rotActive = false; rotNorm = 0; tickDrive(); }
 );
 
-function sendMotor() {
-  if (currentMode !== 'one') return;
+// Combine all active inputs into one body twist (m/s, rad/s), pre-scaled by the
+// speed slider. +ccw convention: pushing right turns right (negative angular).
+function computeTwist() {
   const scale = parseInt(speedSlider.value) / 4095;
-
-  if (pidOn()) {
-    // Closed-loop: joystick -> body twist (linear, angular).
-    const ma = moveAngle * Math.PI / 180, ra = rotAngle * Math.PI / 180;
-    const forward = moveNorm * Math.cos(ma);          // up = forward
-    const steer   = moveNorm * Math.sin(ma);          // right = +x
-    const rotSteer = rotNorm * Math.sin(ra);          // dedicated turn joystick
-    const linear  = forward * MAX_LINEAR * scale;
-    const angular = -(steer + rotSteer) * MAX_ANGULAR * scale;  // +ccw
-    send(JSON.stringify({ type: 'drive', linear: +linear.toFixed(3),
-                          angular: +angular.toFixed(3) }));
-    return;
-  }
-
-  // Legacy open-loop mecanum mix.
-  const moveSpeed = Math.round(moveNorm * parseInt(speedSlider.value));
-  const rotSpeed = Math.round(rotNorm * parseInt(speedSlider.value));
-  if (moveSpeed === 0 && rotSpeed === 0) {
-    send('CMD_MOTOR#0#0#0#0');
-  } else {
-    send('CMD_M_MOTOR#' + Math.round(moveAngle) + '#' + moveSpeed + '#' +
-         Math.round(rotAngle) + '#' + rotSpeed);
-  }
+  const ma = moveAngle * Math.PI / 180, ra = rotAngle * Math.PI / 180;
+  const forward  = moveActive ? moveNorm * Math.cos(ma) : 0;   // up = forward
+  const steer    = moveActive ? moveNorm * Math.sin(ma) : 0;   // right = +x
+  const rotSteer = rotActive  ? rotNorm  * Math.sin(ra) : 0;   // turn joystick
+  const linear  = (forward + keyLinear) * MAX_LINEAR * scale;
+  const angular = (-(steer + rotSteer) + btnRot + keyAngular) * MAX_ANGULAR * scale;
+  return { linear, angular };
 }
 
-// Send at ~15 Hz
-setInterval(() => {
-  if ((moveActive || rotActive) && currentMode === 'one') {
-    sendMotor();
-  }
-}, 66);
+function anyMotion() {
+  return moveActive || rotActive || btnRot !== 0 ||
+         keyLinear !== 0 || keyAngular !== 0;
+}
 
-// --- Rotation buttons ---
+function sendStop() {
+  send(JSON.stringify({ type: 'drive', linear: 0, angular: 0 }));
+}
+
+// Single motion pump: sends a drive twist at ~15 Hz (well under the
+// controller's 0.1 s command timeout) while any input is active, then one stop
+// when everything goes idle.
+let wasMoving = false;
+function tickDrive() {
+  if (currentMode !== 'one') {
+    if (wasMoving) { sendStop(); wasMoving = false; }
+    return;
+  }
+  if (anyMotion()) {
+    const t = computeTwist();
+    send(JSON.stringify({ type: 'drive',
+                          linear:  +t.linear.toFixed(3),
+                          angular: +t.angular.toFixed(3) }));
+    wasMoving = true;
+  } else if (wasMoving) {
+    sendStop();
+    wasMoving = false;
+  }
+}
+setInterval(tickDrive, 66);
+
+// --- Rotation buttons -> pure-spin twist (held) ---
 function holdBtn(id, onDown, onUp) {
   const el = document.getElementById(id);
   const start = (e) => { e.preventDefault(); el.classList.add('pressed'); onDown(); };
@@ -510,17 +522,19 @@ function holdBtn(id, onDown, onUp) {
   el.addEventListener('mouseleave', end);
 }
 
-const ROT_SPEED = 2000;
-holdBtn('btnRotCW',
-  () => send('CMD_MOTOR#' + (-ROT_SPEED) + '#' + (-ROT_SPEED) + '#' + ROT_SPEED + '#' + ROT_SPEED),
-  () => send('CMD_MOTOR#0#0#0#0')
+holdBtn('btnRotCW',                        // clockwise  = turn right = -angular
+  () => { btnRot = -1; tickDrive(); },
+  () => { btnRot = 0;  tickDrive(); }
 );
-holdBtn('btnRotCCW',
-  () => send('CMD_MOTOR#' + ROT_SPEED + '#' + ROT_SPEED + '#' + (-ROT_SPEED) + '#' + (-ROT_SPEED)),
-  () => send('CMD_MOTOR#0#0#0#0')
+holdBtn('btnRotCCW',                       // counter-cw = turn left  = +angular
+  () => { btnRot = 1; tickDrive(); },
+  () => { btnRot = 0; tickDrive(); }
 );
 document.getElementById('btnStop').addEventListener('click', () => {
-  send('CMD_MOTOR#0#0#0#0');
+  // Cancel every input and brake through the controller.
+  moveActive = rotActive = false; moveNorm = rotNorm = 0;
+  btnRot = 0; keyLinear = keyAngular = 0;
+  sendStop();
 });
 
 // --- Servo ---
@@ -608,24 +622,32 @@ updateSignBtns();
 // --- Battery poll ---
 setInterval(() => { send('CMD_POWER'); }, 5000);
 
-// --- Keyboard controls (desktop) ---
-const keyMap = {
-  'w': () => send('CMD_MOTOR#2000#2000#2000#2000'),
-  's': () => send('CMD_MOTOR#-2000#-2000#-2000#-2000'),
-  'a': () => send('CMD_MOTOR#-2000#2000#2000#-2000'),
-  'd': () => send('CMD_MOTOR#2000#-2000#-2000#2000'),
-  'q': () => send('CMD_MOTOR#2000#2000#-2000#-2000'),
-  'e': () => send('CMD_MOTOR#-2000#-2000#2000#2000'),
-};
+// --- Keyboard controls (desktop) -> twist via the drive controller ---
+// W/S drive, A/D and Q/E turn. Held keys are folded into the twist that the
+// motion pump (tickDrive) sends; no CMD_MOTOR.
+const DRIVE_KEYS = new Set(['w', 'a', 's', 'd', 'q', 'e']);
 const keysDown = new Set();
+function recomputeKeys() {
+  let lin = 0, ang = 0;
+  if (keysDown.has('w')) lin += 1;
+  if (keysDown.has('s')) lin -= 1;
+  if (keysDown.has('a')) ang += 1;   // turn left  (+ccw)
+  if (keysDown.has('d')) ang -= 1;   // turn right (-cw)
+  if (keysDown.has('q')) ang += 1;   // rotate left
+  if (keysDown.has('e')) ang -= 1;   // rotate right
+  keyLinear = clampUnit(lin);
+  keyAngular = clampUnit(ang);
+}
 document.addEventListener('keydown', (e) => {
-  if (currentMode !== 'one' || keysDown.has(e.key)) return;
-  keysDown.add(e.key);
-  if (keyMap[e.key]) keyMap[e.key]();
+  if (currentMode !== 'one') return;
+  const k = e.key.toLowerCase();
+  if (!DRIVE_KEYS.has(k) || keysDown.has(k)) return;
+  keysDown.add(k); recomputeKeys(); tickDrive();
 });
 document.addEventListener('keyup', (e) => {
-  keysDown.delete(e.key);
-  if (keyMap[e.key] && keysDown.size === 0) send('CMD_MOTOR#0#0#0#0');
+  const k = e.key.toLowerCase();
+  if (!keysDown.has(k)) return;
+  keysDown.delete(k); recomputeKeys(); tickDrive();
 });
 </script>
 </body>
