@@ -81,7 +81,7 @@ class Server:
         # --- closed-loop drivetrain (encoders + odometry + PID) ---
         self.encoders  = WheelEncoders(CONFIG.sides)
         self.drive     = DriveController(self.PWM, self.encoders, 
-                                         config=CONFIG, ultrasonic=self.ultrasonic)
+                                         config=CONFIG, dist_sensor=self.ultrasonic)
         self._rotate_thread = None
         try:
             self.drive.start()   # begins encoder listening + control loop
