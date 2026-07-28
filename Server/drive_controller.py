@@ -103,8 +103,8 @@ class DriveController:
         self._thread      : Optional[threading.Thread] = None
         self._stop_evt = threading.Event()
         
-        self.dist_arr = deque(maxlen=5)     # recent VALID readings (median filter)
-        self.front_distance_cm = None       # median front distance, for telemetry
+        self.dist_arr = deque(maxlen=3)     # recent VALID readings (min = closest)
+        self.front_distance_cm = None       # latest valid front distance, for UI
         self._dist_thread: Optional[threading.Thread] = None
         self._dist_stop_evt = threading.Event()
         self.dist_guard_lock = threading.Lock()
@@ -123,7 +123,10 @@ class DriveController:
 
     def set_twist(self, linear: float, angular: float) -> None:
         """Command a body velocity (m/s, rad/s). Cancels any active move and
-        engages velocity control."""
+        engages velocity control. While the front guard is engaged, forward
+        velocity is refused up front (reverse / turning stay allowed)."""
+        if linear > 0.0 and self._front_guard_engaged():
+            linear = 0.0
         with self._lock:
             self._move = None
         self._apply_target(linear, angular)
@@ -155,7 +158,12 @@ class DriveController:
         PID keeps them equal -> straight line. Closed on the encoders.
         (``speed`` is accepted for API compatibility; the move speed is set by
         the position gains' output_limit.)
+
+        A forward move is refused while the front guard is engaged, so you can't
+        start driving into an obstacle that is already within the limit.
         """
+        if distance > 0.0 and self._front_guard_engaged():
+            return
         self._start_move(distance, distance)
 
     def turn_in_place(self, angle_deg: float, ang_speed: float = None) -> None:
@@ -193,19 +201,20 @@ class DriveController:
             return Twist(), True   # safety stop, still engaged
         return target, engaged
 
-    def _front_blocked(self, duty_left: float, duty_right: float) -> bool:
-        """True when the front distance guard is engaged AND the command is
-        net-forward (i.e. driving INTO the obstacle).
-
-        The `_dist_guard` thread holds `dist_guard_lock` while an obstacle is
-        both closer than `minimum_front_distance_cm` and closing. We veto only
-        net-forward drive (duty sum > 0) so the kart can still reverse or turn
-        in place to escape. With no distance sensor injected it never blocks
+    def _front_guard_engaged(self) -> bool:
+        """The front distance guard is holding: an obstacle is closer than
+        `minimum_front_distance_cm` (the `_dist_guard` thread holds
+        `dist_guard_lock`). With no distance sensor injected it is never engaged
         (unit tests / sim).
         """
-        return (self.dist_sensor is not None
-                and self.dist_guard_lock.locked()
-                and (duty_left + duty_right) > 0.0)
+        return self.dist_sensor is not None and self.dist_guard_lock.locked()
+
+    def _front_blocked(self, duty_left: float, duty_right: float) -> bool:
+        """Guard engaged AND the command is net-forward (driving INTO the
+        obstacle). We veto only net-forward drive (duty sum > 0) so the kart can
+        still reverse or turn in place to escape.
+        """
+        return self._front_guard_engaged() and (duty_left + duty_right) > 0.0
 
     # -- control loop ------------------------------------------------------
     def step(self, dt: float) -> dict:
@@ -362,20 +371,20 @@ class DriveController:
 
             raw = self.dist_sensor.get_distance()
             # get_distance() returns 255 when >=3 of its 5 pings time out -- a
-            # FAILED read, not a real "far" measurement. Those spikes were
-            # flipping the guard off, so drop them and median-filter what's left.
+            # FAILED read, not a real "far" measurement -- so drop those spikes.
+            # It already medians 5 pings internally, so a single VALID reading
+            # is trustworthy and we act on it with no extra smoothing lag.
             if raw is not None and 0 < raw < 255:
                 self.dist_arr.append(raw)
-            if self.dist_arr:
-                s = sorted(self.dist_arr)
-                self.front_distance_cm = int(s[len(s) // 2])   # median, for UI
+                self.front_distance_cm = raw          # latest valid, for the UI
 
             # dist_guard_lock is a plain (non-reentrant) Lock used as a flag;
-            # only this thread touches it. Engage below the limit, release only
-            # past limit+hysteresis. Direction is handled by the forward-only
-            # veto in _front_blocked, so we gate purely on proximity here.
-            f = self.front_distance_cm
-            if f is not None:
+            # only this thread touches it. Asymmetric for safety: ENGAGE on the
+            # CLOSEST recent reading (trips the instant one close sample lands),
+            # RELEASE only when the whole recent window is clear (+hysteresis),
+            # so a lone spurious far reading can't un-block us near a wall.
+            if self.dist_arr:
+                f = min(self.dist_arr)
                 if f < limit and not self.dist_guard_lock.locked():
                     self.dist_guard_lock.acquire()
                 elif f > limit + hysteresis and self.dist_guard_lock.locked():
