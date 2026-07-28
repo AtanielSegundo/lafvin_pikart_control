@@ -17,16 +17,22 @@ class Ultrasonic:
         GPIO.setup(self.echo_pin, GPIO.IN)
 
     # obtain pulse time of a pin under timeOut
-    def pulseIn(self, pin, level, timeOut):  
+    def pulseIn(self, pin, level, timeOut):
+        timeOut_us = timeOut * 0.000001
         t0 = time.time()
         while (GPIO.input(pin) != level):
-            if ((time.time() - t0) > timeOut * 0.000001):
+            
+            if ((time.time() - t0) > timeOut_us):
                 return 0;
+            
         t0 = time.time()
         while (GPIO.input(pin) == level):
-            if ((time.time() - t0) > timeOut * 0.000001):
+            
+            if ((time.time() - t0) > timeOut_us):
                 return 0;
+            
         pulseTime = (time.time() - t0) * 1000000
+        
         return pulseTime
 
     def get_distance(self):  # get the measurement results of ultrasonic module,with unit: cm
@@ -46,6 +52,8 @@ class Ultrasonic:
 
         return int(final_distance)  # 返回处理后的整数距离值
         #return int(distance_cm[2])
+    
+    
     
     def run(self):
         self.PWM = Motor()

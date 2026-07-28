@@ -18,12 +18,17 @@ Two engagement states:
   * released (default): odometry keeps integrating, but the loop does NOT drive
     the motors, leaving raw ``CMD_MOTOR`` duty commands in control.
   * engaged: a velocity command took over; PID actively drives the motors.
+
+When a distance sensor is injected, a front collision guard runs in its own
+thread (:meth:`_dist_guard`): it holds ``dist_guard_lock`` whenever an obstacle
+is both closer than ``minimum_front_distance_cm`` and closing, and ``step``
+then vetoes net-forward motor drive (reverse / turn-in-place stay allowed).
 """
 from __future__ import annotations
 
 import threading
 import time
-from typing import Callable, Optional
+from typing import Callable, Optional, TYPE_CHECKING
 
 import math
 
@@ -32,6 +37,13 @@ from kinematics import SkidSteerKinematics, Twist, WheelSpeeds
 from odometry import Pose, SkidSteerOdometry
 from pid import PID
 
+from collections import deque
+
+if TYPE_CHECKING:
+    # Import for type hints only: Ultrasonic pulls in RPi.GPIO, which is absent
+    # off-Pi. `from __future__ import annotations` keeps the annotation lazy, so
+    # the controller still imports (and unit-tests run) on a laptop/CI.
+    from Ultrasonic import Ultrasonic
 
 def _clamp(value: float, limit: float) -> float:
     return max(-limit, min(limit, value))
@@ -56,14 +68,16 @@ def _stiction_floor(duty: float, remaining: float, gains) -> float:
 class DriveController:
     def __init__(self, motor, encoders, config: RobotConfig = CONFIG,
                  clock: Callable[[], float] = time.monotonic,
+                 dist_sensor:Ultrasonic = None,
                  plant: "Optional[SimulatedDrivePlant]" = None):
-        self.motor = motor
-        self.encoders = encoders
-        self.config = config
-        self._clock = clock
-        self.plant = plant
+        self.motor       = motor
+        self.encoders    = encoders
+        self.config      = config
+        self._clock      = clock
+        self.plant       = plant
+        self.dist_sensor = dist_sensor
 
-        self.kin = SkidSteerKinematics(config.wheel)
+        self.kin  = SkidSteerKinematics(config.wheel)
         self.odom = SkidSteerOdometry(config.wheel)
 
         # Velocity PIDs (teleop / `drive`): error in m/s -> duty.
@@ -80,14 +94,19 @@ class DriveController:
         self.pos_right = PID(pg.kp, pg.ki, pg.kd, 0.0,
                              pg.output_limit, pg.integral_limit)
 
-        self._target = Twist()
+        self._target      = Twist()
         self._target_time = clock()
-        self._engaged = False
-        self._move = None          # active position move, if any
-        self._lock = threading.Lock()
+        self._engaged     = False
+        self._move        = None              # active position move, if any
+        self._lock        = threading.Lock()
 
-        self._thread: Optional[threading.Thread] = None
+        self._thread      : Optional[threading.Thread] = None
         self._stop_evt = threading.Event()
+        
+        self.dist_arr = deque(maxlen=2)
+        self._dist_thread: Optional[threading.Thread] = None
+        self._dist_stop_evt = threading.Event()
+        self.dist_guard_lock = threading.Lock()
 
         self._telemetry = self._blank_telemetry()
 
@@ -173,6 +192,20 @@ class DriveController:
             return Twist(), True   # safety stop, still engaged
         return target, engaged
 
+    def _front_blocked(self, duty_left: float, duty_right: float) -> bool:
+        """True when the front distance guard is engaged AND the command is
+        net-forward (i.e. driving INTO the obstacle).
+
+        The `_dist_guard` thread holds `dist_guard_lock` while an obstacle is
+        both closer than `minimum_front_distance_cm` and closing. We veto only
+        net-forward drive (duty sum > 0) so the kart can still reverse or turn
+        in place to escape. With no distance sensor injected it never blocks
+        (unit tests / sim).
+        """
+        return (self.dist_sensor is not None
+                and self.dist_guard_lock.locked()
+                and (duty_left + duty_right) > 0.0)
+
     # -- control loop ------------------------------------------------------
     def step(self, dt: float) -> dict:
         """Run exactly one control iteration and return the telemetry dict."""
@@ -181,9 +214,12 @@ class DriveController:
 
         # 1. Feedback: mean count deltas per side since the last step.
         d_counts_left, d_counts_right = self.encoders.read_reset_sides()
+        
         mpc = self.config.wheel.meters_per_count
+        
         d_left = d_counts_left * mpc
         d_right = d_counts_right * mpc
+        
         self.odom.update_from_distances(d_left, d_right, dt)
         measured = WheelSpeeds(left=d_left / dt, right=d_right / dt)
 
@@ -195,10 +231,11 @@ class DriveController:
         target = Twist()
         wheel_target = WheelSpeeds()
         move_info = None
+        guard_blocked = False
 
         if move is not None:
-            # --- POSITION control: per-side distance PID -> duty ---
             move.accumulate(d_left, d_right, dt)
+        
             duty_left = self.pos_left.update(move.target_left,
                                              move.traveled_left, dt)
             duty_right = self.pos_right.update(move.target_right,
@@ -206,8 +243,10 @@ class DriveController:
             err_l, err_r = move.errors()
             # Deadband/stiction compensation so a nearly-arrived side doesn't
             # stall short below the motor's move threshold.
+        
             duty_left = _stiction_floor(duty_left, err_l, self.config.position)
             duty_right = _stiction_floor(duty_right, err_r, self.config.position)
+        
             if move.is_done(measured.left, measured.right):
                 duty_left = duty_right = 0.0
                 self.pos_left.reset()
@@ -226,6 +265,14 @@ class DriveController:
                                   "right": round(err_r, 4)},
                 }
             engaged = True
+            # Front collision guard: veto driving into a close, closing obstacle
+            # and reset the position PIDs so there's no wind-up lurch on release.
+            if self._front_blocked(duty_left, duty_right):
+                duty_left = duty_right = 0.0
+                self.pos_left.reset()
+                self.pos_right.reset()
+                guard_blocked = True
+                
             self.motor.setMotorModel(int(round(duty_left)), int(round(duty_left)),
                                      int(round(duty_right)), int(round(duty_right)))
         else:
@@ -242,6 +289,13 @@ class DriveController:
                                                      measured.left, dt)
                     duty_right = self.pid_right.update(wheel_target.right,
                                                        measured.right, dt)
+                # Front collision guard: veto driving into a close, closing
+                # obstacle and reset the velocity PIDs to avoid a wind-up lurch.
+                if self._front_blocked(duty_left, duty_right):
+                    duty_left = duty_right = 0.0
+                    self.pid_left.reset()
+                    self.pid_right.reset()
+                    guard_blocked = True
                 self.motor.setMotorModel(
                     int(round(duty_left)), int(round(duty_left)),
                     int(round(duty_right)), int(round(duty_right)))
@@ -264,43 +318,88 @@ class DriveController:
                              "right": round(wheel_target.right, 4)},
             "duty": {"left": int(round(duty_left)), "right": int(round(duty_right))},
             "engaged": engaged,
+            "guard_blocked": guard_blocked,
             "goal_active": move is not None,
             "move": move_info,
             "encoders": self.encoders.raw_totals(),   # raw per-motor counts
         }
         with self._lock:
             self._telemetry = snapshot
+        
         return snapshot
 
     def _run(self) -> None:
         period = 1.0 / self.config.control.loop_hz
         last = self._clock()
+        
         while not self._stop_evt.is_set():
             now = self._clock()
             dt = now - last
             last = now
+    
             try:
                 self.step(dt if dt > 0 else period)
-            except Exception as exc:  # never let the loop die silently
+            except Exception as exc:
                 print(f"[DriveController] step error: {exc}")
-            # Maintain the loop rate.
+            
             sleep = period - (self._clock() - now)
+            
             if sleep > 0:
                 self._stop_evt.wait(sleep)
 
+    # This thread guards the physical front of the Kart: it holds
+    # dist_guard_lock while an obstacle is close AND closing, and step() reads
+    # that state (via _front_blocked) to veto forward motion.
+    def _dist_guard(self) -> None:
+        period = 1.0 / (2 * self.config.control.loop_hz)
+
+        while not self._dist_stop_evt.is_set():
+            now = self._clock()
+
+            f_dist_now = self.dist_sensor.get_distance()
+            self.dist_arr.append(f_dist_now)
+
+            below_limit = f_dist_now < self.config.control.minimum_front_distance_cm
+            closing = (len(self.dist_arr) == 2
+                       and (self.dist_arr[1] - self.dist_arr[0]) < 0)
+            
+            # dist_guard_lock is a plain (non-reentrant) Lock used as a flag:
+            # only this thread touches it, so guard acquire/release with
+            # locked() to avoid a self-deadlock on a repeated acquire.
+            if below_limit and closing:
+                if not self.dist_guard_lock.locked():
+                    self.dist_guard_lock.acquire()
+            elif self.dist_guard_lock.locked():
+                self.dist_guard_lock.release()
+
+            sleep = period - (self._clock() - now)
+
+            if sleep > 0:
+                self._dist_stop_evt.wait(sleep)
+
+    
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
         self.encoders.begin()
+
         self._stop_evt.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True,
-                                        name="DriveController")
+        self._thread = threading.Thread(target=self._run, daemon=True, name="DriveController")
         self._thread.start()
+
+        # Front collision guard only runs if a distance sensor was injected.
+        if self.dist_sensor is not None:
+            self._dist_stop_evt.clear()
+            self._dist_thread = threading.Thread(target=self._dist_guard, daemon=True, name="DistGuard")
+            self._dist_thread.start()
 
     def shutdown(self) -> None:
         self._stop_evt.set()
+        self._dist_stop_evt.set()
         if self._thread:
             self._thread.join(timeout=1.0)
+        if self._dist_thread:
+            self._dist_thread.join(timeout=1.0)
         try:
             self.motor.setMotorModel(0, 0, 0, 0)
         except Exception:
@@ -324,6 +423,7 @@ class DriveController:
             "wheel_target": {"left": 0.0, "right": 0.0},
             "duty": {"left": 0, "right": 0},
             "engaged": False,
+            "guard_blocked": False,
             "goal_active": False,
             "move": None,
             "encoders": {},

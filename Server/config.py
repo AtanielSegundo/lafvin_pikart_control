@@ -172,7 +172,8 @@ MOTOR_CHANNELS = {
 class ControlConfig:
     loop_hz: float = 20.0             # closed-loop update rate
     telemetry_hz: float = 200.0       # rate telemetry is pushed to clients
-    command_timeout: float = 0.1      # s; stop motors if no drive cmd arrives
+    command_timeout: float    = 0.1      # s; stop motors if no drive cmd arrives
+    minimum_front_distance_cm = 5
     max_linear: float = 0.6           # m/s, saturates drive commands
     max_angular: float = 4.0          # rad/s
 
