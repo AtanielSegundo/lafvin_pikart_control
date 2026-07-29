@@ -50,7 +50,16 @@ class Server:
         self.PWM        = Motor()
         self.servo      = Servo()
         self.led        = Led()
-        self.ultrasonic = Ultrasonic()
+        # Prefer the pigpio ultrasonic (echo timed by pigpiod in C, immune to
+        # GIL/thread jitter); fall back to the RPi.GPIO busy-wait sensor if
+        # pigpio/pigpiod is unavailable.
+        try:
+            from ultrasonic_pigpio import UltrasonicPigpio
+            self.ultrasonic = UltrasonicPigpio()
+            print("[ultrasonic] using pigpio (hardware-timed echo)")
+        except Exception as e:                      # noqa: BLE001
+            print(f"[ultrasonic] pigpio unavailable ({e}); RPi.GPIO fallback")
+            self.ultrasonic = Ultrasonic()
         self.buzzer     = Buzzer()
         self.adc        = Adc()
         self.light      = Light()

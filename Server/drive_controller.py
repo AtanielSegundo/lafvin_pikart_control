@@ -370,11 +370,11 @@ class DriveController:
             now = self._clock()
 
             raw = self.dist_sensor.get_distance()
-            # get_distance() returns 255 when >=3 of its 5 pings time out -- a
-            # FAILED read, not a real "far" measurement -- so drop those spikes.
-            # It already medians 5 pings internally, so a single VALID reading
-            # is trustworthy and we act on it with no extra smoothing lag.
-            if raw is not None and 0 < raw < 255:
+            # Validity is sensor-agnostic: the pigpio reader returns real cm
+            # (incl. a large far/clear value), while the RPi.GPIO fallback uses
+            # 255 as its "failed read" sentinel -- drop that (and None), keep the
+            # rest. No extra smoothing here, so a fresh reading acts immediately.
+            if raw is not None and raw > 0 and raw != 255:
                 self.dist_arr.append(raw)
                 self.front_distance_cm = raw          # latest valid, for the UI
 
