@@ -72,10 +72,10 @@ class PIDGains:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class PositionGains:
-    kp: float = 10000.0      # duty per metre of error
-    ki: float = 2000.0       # gentle backstop for residual error; its
+    kp: float = 12000.0      # duty per metre of error
+    ki: float = 1500.0       # gentle backstop for residual error; its
                              # contribution is bounded by integral_limit below
-    kd: float = 1400.0       # duty per (m/s) — damping
+    kd: float = 500.0       # duty per (m/s) — damping
     output_limit  : float = 2560.0  # gentle duty cap during moves
     integral_limit: float = 400.0
     tolerance     : float = 0.01    # m, arrival tolerance
