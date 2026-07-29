@@ -3,15 +3,6 @@
 HC-SR04 ultrasonic read via pigpio -- the echo pulse is timed by the pigpiod
 daemon (C, microsecond hardware ticks), NOT by a Python busy-wait.
 
-Why: Ultrasonic.get_distance() times the echo with RPi.GPIO `pulseIn`, a pure
-Python loop. Under the GIL (control loop + telemetry + camera threads) that loop
-gets preempted mid-pulse, so it misses the echo edge -> the 255 "failed read"
-sentinel, plus latency from blocking timeouts. pigpio timestamps every echo edge
-in C, immune to Python scheduling, so:
-  * readings are accurate (no missed-edge dropouts / 255 spikes), and
-  * get_distance() is non-blocking -- it returns the latest value the echo
-    callback computed, so the caller's guard loop never stalls.
-
 Matches the encoders' pigpio usage (Server/encoders.py): guards the import and
 raises cleanly when pigpio / pigpiod isn't available so the caller can fall back
 to the RPi.GPIO sensor.
@@ -29,10 +20,7 @@ try:
 except ImportError:
     _PIGPIO_AVAILABLE = False
 
-
-# Speed of sound ~343 m/s at 20 C = 0.0343 cm/us; distance = width_us * v / 2.
 _CM_PER_US = 0.0343 / 2.0
-
 
 class UltrasonicPigpio:
     def __init__(self, trigger=27, echo=22, pi=None,
@@ -62,9 +50,6 @@ class UltrasonicPigpio:
         self._lock = threading.Lock()
         self._cb = self._pi.callback(echo, pigpio.EITHER_EDGE, self._on_edge)
 
-        # Light trigger thread: a 10 us pulse every ping_interval. The echo is
-        # captured asynchronously by _on_edge, so this only sleeps (releases the
-        # GIL) -- no busy-wait, no contention with the control loop.
         self._running = True
         self._t = threading.Thread(target=self._ping_loop, daemon=True,
                                    name="UltrasonicPing")

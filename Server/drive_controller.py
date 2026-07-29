@@ -275,16 +275,25 @@ class DriveController:
                                   "right": round(err_r, 4)},
                 }
             engaged = True
-            # Front collision guard: veto driving into a close, closing obstacle
-            # and reset the position PIDs so there's no wind-up lurch on release.
+
+            # Front collision guard: obstacle within the limit and this move
+            # drives INTO it. Cancel the move, brake to zero, reset the position
+            # PIDs (no wind-up). Do NOT early-return -- we must still command the
+            # motors to 0 below and publish telemetry.
             if self._front_blocked(duty_left, duty_right):
                 duty_left = duty_right = 0.0
                 self.pos_left.reset()
                 self.pos_right.reset()
+                with self._lock:
+                    self._move = None          # cancel the forward move
+                    self._target = Twist()     # hold zero on following ticks
+                move = None                    # -> goal_active False in telemetry
+                move_info = None
                 guard_blocked = True
-                
+
             self.motor.setMotorModel(int(round(duty_left)), int(round(duty_left)),
                                      int(round(duty_right)), int(round(duty_right)))
+            
         else:
             # --- VELOCITY control ---
             target, engaged = self._current_target()
@@ -378,11 +387,6 @@ class DriveController:
                 self.dist_arr.append(raw)
                 self.front_distance_cm = raw          # latest valid, for the UI
 
-            # dist_guard_lock is a plain (non-reentrant) Lock used as a flag;
-            # only this thread touches it. Asymmetric for safety: ENGAGE on the
-            # CLOSEST recent reading (trips the instant one close sample lands),
-            # RELEASE only when the whole recent window is clear (+hysteresis),
-            # so a lone spurious far reading can't un-block us near a wall.
             if self.dist_arr:
                 f = min(self.dist_arr)
                 if f < limit and not self.dist_guard_lock.locked():
