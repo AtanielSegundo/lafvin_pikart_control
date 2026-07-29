@@ -278,8 +278,7 @@ class DriveController:
 
             # Front collision guard: obstacle within the limit and this move
             # drives INTO it. Cancel the move, brake to zero, reset the position
-            # PIDs (no wind-up). Do NOT early-return -- we must still command the
-            # motors to 0 below and publish telemetry.
+            # PIDs (no wind-up).
             if self._front_blocked(duty_left, duty_right):
                 duty_left = duty_right = 0.0
                 self.pos_left.reset()

@@ -67,11 +67,11 @@ class PIDGains:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class PositionGains:
-    kp: float = 12000.0      # duty per metre of error
+    kp: float = 10000.0      # duty per metre of error
     ki: float = 2000.0       # gentle backstop for residual error; its
                              # contribution is bounded by integral_limit below
     kd: float = 1000.0       # duty per (m/s) — damping
-    output_limit: float = 2000.0     # gentle duty cap during moves
+    output_limit: float = 3000.0     # gentle duty cap during moves
     integral_limit: float = 800.0
     tolerance: float = 0.01          # m, arrival tolerance
     stop_speed: float = 0.03         # m/s below which we consider it stopped
@@ -107,10 +107,10 @@ class PositionGains:
 # stay in the Pi's GPIO-safe range -- the header pins are NOT 5 V tolerant.
 # ---------------------------------------------------------------------------
 ENCODER_PINS: Dict[str, Tuple[int, int]] = {
-    "M1": (25, 5),     # upper-left   (rewired to Pi GPIO, phys pins 29/31)
+    "M1": (25, 5),    # upper-left (rewired to Pi GPIO, phys pins 29/31)
     "M2": (26, 20),   # lower-left
-    "M3": (6, 12),    # lower-right  (moved off 19/16 — was under-counting)
-    "M4": (8, 7),     # upper-right  (rewired to Pi GPIO SPI0 pins; needs SPI off)
+    "M3": (6, 12),    # lower-right (moved off 19/16 — was under-counting)
+    "M4": (8, 7),     # upper-right (rewired to Pi GPIO SPI0 pins; needs SPI off)
 }
 
 # ---------------------------------------------------------------------------
@@ -152,11 +152,6 @@ class SideMapping:
         "M1": 1, "M2": 1, "M3": -1, "M4": -1,
     })
 
-
-# ---------------------------------------------------------------------------
-# Motor PWM channel wiring on the PCA9685 (from Motor.py).
-# Each wheel uses two channels (forward, reverse).
-# ---------------------------------------------------------------------------
 MOTOR_CHANNELS = {
     "left_upper":  (0, 1),
     "left_lower":  (2, 3),
@@ -170,10 +165,10 @@ MOTOR_CHANNELS = {
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class ControlConfig:
-    loop_hz: float = 20.0             # closed-loop update rate
-    telemetry_hz: float = 200.0       # rate telemetry is pushed to clients
-    command_timeout: float    = 0.1      # s; stop motors if no drive cmd arrives
-    minimum_front_distance_cm: int = 5   # front guard trips below this (cm)
+    loop_hz: float = 50.0             # closed-loop update rate
+    telemetry_hz: float = 500.0       # rate telemetry is pushed to clients
+    command_timeout: float = 0.1      # s; stop motors if no drive cmd arrives
+    minimum_front_distance_cm: int = 10   # front guard trips below this (cm)
     max_linear: float = 0.6           # m/s, saturates drive commands
     max_angular: float = 4.0          # rad/s
 
