@@ -75,19 +75,13 @@ class PositionGains:
     kp: float = 10000.0      # duty per metre of error
     ki: float = 2000.0       # gentle backstop for residual error; its
                              # contribution is bounded by integral_limit below
-    kd: float = 1000.0       # duty per (m/s) — damping
-    output_limit: float = 3000.0     # gentle duty cap during moves
-    integral_limit: float = 800.0
-    tolerance: float = 0.01          # m, arrival tolerance
-    stop_speed: float = 0.03         # m/s below which we consider it stopped
-    max_time: float = 12.0           # s, safety timeout per move
-    # Stiction / deadband floor: while a side has NOT arrived, don't let its
-    # command sit below this magnitude, or the PID output (kp*error) decays
-    # below the motor's move threshold near the target and the wheel stalls
-    # short, humming, until max_time. Set to the lowest PWM that reliably
-    # starts a wheel from rest (measure it: ramp one wheel until it moves).
-    # 0 disables it. Sign is preserved, so reverse moves still get -min_move.
-    min_move_duty: float = 1000.0
+    kd: float = 1400.0       # duty per (m/s) — damping
+    output_limit  : float = 2560.0  # gentle duty cap during moves
+    integral_limit: float = 400.0
+    tolerance     : float = 0.01    # m, arrival tolerance
+    stop_speed    : float = 0.02    # m/s below which we consider it stopped
+    max_time      : float = 12.0    # s, safety timeout per move
+    min_move_duty : float = 1000.0
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +164,7 @@ MOTOR_CHANNELS = {
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class ControlConfig:
-    loop_hz: float = 50.0             # closed-loop update rate
+    loop_hz: float = 25.0             # closed-loop update rate
     telemetry_hz: float = 500.0       # rate telemetry is pushed to clients
     command_timeout: float = 0.1      # s; stop motors if no drive cmd arrives
     minimum_front_distance_cm: int = 10   # front guard trips below this (cm)
@@ -199,5 +193,4 @@ class RobotConfig:
     network : NetworkConfig = field(default_factory=NetworkConfig)
 
 
-# default instance
 CONFIG = RobotConfig()
