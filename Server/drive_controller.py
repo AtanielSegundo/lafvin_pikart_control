@@ -110,10 +110,6 @@ class DriveController:
         self.pos_right = PID(pg.kp, pg.ki, pg.kd, 0.0,
                              pg.output_limit, pg.integral_limit)
 
-        # Heading PID (gyro-closed turn): error in RAD -> angular vel (rad/s).
-        hg = config.heading
-        self.heading_pid = PID(hg.kp, hg.ki, hg.kd, 0.0,
-                               hg.output_limit, hg.integral_limit)
 
         self._target      = Twist()
         self._target_time = clock()
@@ -180,7 +176,6 @@ class DriveController:
         self.pid_right.reset()
         self.pos_left.reset()
         self.pos_right.reset()
-        self.heading_pid.reset()
 
     # -- high-level moves (per-side POSITION control) ----------------------
     def drive_distance(self, distance: float, speed: float = None) -> None:
@@ -233,27 +228,30 @@ class DriveController:
 
     def _start_heading(self, target_yaw: float) -> None:
         """Engage a gyro-closed turn to an absolute yaw (radians)."""
-        self.heading_pid.reset()
         with self._lock:
             self._move = None
             self._heading_target = target_yaw
             self._heading_time = self._clock()
             self._engaged = True
 
-    def _heading_step(self, dt: float, yaw: float) -> "tuple[Twist, bool]":
-        """One gyro-heading iteration: returns (target twist, done). Done when
-        within tolerance AND the turn has settled, or on a safety timeout."""
+    def _heading_duty(self, target_yaw: float, yaw: float,
+                      elapsed: float) -> "tuple[float, float, bool]":
+        """One gyro-turn iteration -> (duty_left, duty_right, done). Commands
+        DUTY directly: a proportional magnitude, capped, decelerated near the
+        target, then floored at turn_min_duty so it never stalls short. `error`
+        is NOT wrapped, so it turns the full commanded amount. Done when within
+        tolerance or on a safety timeout."""
         hg = self.config.heading
-        with self._lock:
-            target_yaw = self._heading_target
-            elapsed = self._clock() - self._heading_time
         error = target_yaw - yaw
-        rate = self.odom.angular_velocity          # gyro-fed body rate (rad/s)
-        if (abs(error) < hg.tolerance and abs(rate) < hg.settle_rate) \
-                or elapsed >= hg.max_time:
-            return Twist(), True
-        angular = self.heading_pid.update(target_yaw, yaw, dt)   # rad/s, clamped
-        return Twist(0.0, angular), False
+        if abs(error) < hg.tolerance or elapsed >= hg.max_time:
+            return 0.0, 0.0, True
+        mag = hg.turn_kp_duty * abs(error)
+        mag = min(mag, hg.turn_max_duty)
+        if hg.turn_decel_gain > 0.0:
+            mag = min(mag, hg.turn_decel_gain * math.sqrt(abs(error)))
+        mag = max(mag, hg.turn_min_duty)
+        # +ccw (error > 0): left side backward, right side forward.
+        return (-mag, mag, False) if error > 0.0 else (mag, -mag, False)
 
     # -- go-to-pose (turn -> drive -> turn, on the gyro-accurate odometry) --
     def goto_pose(self, x: float, y: float, theta_deg: float = None) -> None:
@@ -443,33 +441,41 @@ class DriveController:
             self.motor.setMotorModel(int(round(duty_left)), int(round(duty_left)),
                                      int(round(duty_right)), int(round(duty_right)))
             
-        else:
-            # --- pick the velocity target: gyro heading turn or teleop ---
-            if heading_running:
-                if gyro_yaw is None:
-                    # Gyro dropped mid-turn: abort safely (stop, drop the turn).
-                    with self._lock:
-                        self._heading_target = None
-                    self.heading_pid.reset()
-                    target, engaged = Twist(), True
-                else:
-                    target, done = self._heading_step(dt, gyro_yaw)
-                    engaged = True
-                    with self._lock:
-                        tgt = self._heading_target
-                    if tgt is not None:
-                        heading_info = {
-                            "target_deg": round(math.degrees(tgt), 2),
-                            "error_deg": round(math.degrees(tgt - gyro_yaw), 2)}
-                    if done:
-                        with self._lock:
-                            self._heading_target = None
-                        self.heading_pid.reset()
-                        target, heading_info = Twist(), None
+        elif heading_running:
+            # --- gyro turn: per-side DUTY directly (uniform power + decel + ---
+            #     stiction floor), so it doesn't starve the motors near target.
+            engaged = True
+            with self._lock:
+                target_yaw = self._heading_target
+                elapsed = self._clock() - self._heading_time
+            if gyro_yaw is None or target_yaw is None:
+                # Gyro dropped mid-turn (or the turn was cancelled): stop safely.
+                with self._lock:
+                    self._heading_target = None
+                duty_left = duty_right = 0.0
             else:
-                target, engaged = self._current_target()
+                duty_left, duty_right, done = self._heading_duty(
+                    target_yaw, gyro_yaw, elapsed)
+                heading_info = {
+                    "target_deg": round(math.degrees(target_yaw), 2),
+                    "error_deg": round(math.degrees(target_yaw - gyro_yaw), 2)}
+                if done:
+                    with self._lock:
+                        if self._heading_target == target_yaw:
+                            self._heading_target = None
+                    duty_left = duty_right = 0.0
+                    heading_info = None
+            # A pure spin has ~0 net-forward duty, so the guard won't veto it;
+            # applied for consistency (and to stop a lopsided turn into a wall).
+            if self._front_blocked(duty_left, duty_right):
+                duty_left = duty_right = 0.0
+                guard_blocked = True
+            self.motor.setMotorModel(int(round(duty_left)), int(round(duty_left)),
+                                     int(round(duty_right)), int(round(duty_right)))
 
-            # --- shared VELOCITY control ---
+        else:
+            # --- VELOCITY control (teleop / `drive`) ---
+            target, engaged = self._current_target()
             wheel_target = self.kin.inverse(target)
             if engaged:
                 if target.linear == 0.0 and target.angular == 0.0:

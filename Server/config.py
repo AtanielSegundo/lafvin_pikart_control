@@ -96,22 +96,28 @@ class PositionGains:
 
 
 # ---------------------------------------------------------------------------
-# Heading-hold / turn-in-place PID, closed on the MPU6050 gyro yaw.
-# Error is in RADIANS of heading; output is an angular velocity (rad/s) that is
-# fed through the velocity controller (inverse kinematics -> wheel PID). Only
-# used when a gyro is present and connected; otherwise turns fall back to the
-# encoder-distance position move. Tune on hardware.
+# Turn-in-place closed on the MPU6050 gyro yaw. Error is in RADIANS of heading.
+#
+# The turn commands per-side DUTY DIRECTLY (not an angular-velocity setpoint fed
+# through the wheel-speed loop). A velocity loop starves the motors at low
+# commanded speed near the target -- duty drops below stiction and the kart
+# stalls short, humming in place. Commanding duty with a floor guarantees the
+# four wheels always have enough torque to keep scrubbing until it arrives.
+#
+# Profile per tick, magnitude clamped:  turn_kp_duty*|err|  ->  capped at
+# turn_max_duty  ->  decel ceiling turn_decel_gain*sqrt(|err|) near the target
+# ->  floored at turn_min_duty so it never stalls short. Only used with a live
+# gyro; otherwise turns fall back to the encoder-distance move. Tune on hardware.
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class HeadingGains:
-    kp: float = 16.0          # (rad/s) per rad of heading error
-    ki: float = 1.0
-    kd: float = 2.0
-    output_limit  : float = 10.0     # rad/s; clamp to the platform max_angular
-    integral_limit: float = 1.0
-    tolerance     : float = 0.035   # rad (~2 deg) arrival window
-    settle_rate   : float = 0.17    # rad/s (~10 deg/s) below which "stopped"
-    max_time      : float = 8.0     # s, safety timeout per turn
+    turn_kp_duty   : float = 6000.0  # duty per rad of heading error
+    turn_min_duty  : float = 1500.0  # stiction floor: keep turning (all four
+                                     # wheels must scrub) until within tolerance
+    turn_max_duty  : float = 2600.0  # cap on turn duty
+    turn_decel_gain: float = 3500.0  # decel ceiling: duty <= gain*sqrt(err_rad)
+    tolerance      : float = 0.035   # rad (~2 deg) arrival window
+    max_time       : float = 6.0     # s, safety timeout per turn
 
 
 # ---------------------------------------------------------------------------
