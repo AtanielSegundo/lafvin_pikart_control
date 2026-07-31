@@ -35,6 +35,7 @@ ALIASES: Dict[str, str] = {
     "turn": "turn",                         # closed-loop in-place turn (new)
     "goto": "goto",                         # go to pose (x, y, theta) (new)
     "reset_odometry": "reset_odometry",     # (new)
+    "calibrate_imu": "calibrate_imu",       # re-zero the gyro bias (new)
     "set_sign": "set_sign",                 # runtime encoder sign flip (new)
     # peripherals
     "CMD_SERVO": "servo", "servo": "servo",

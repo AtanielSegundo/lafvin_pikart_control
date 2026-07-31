@@ -90,7 +90,13 @@ class Server:
         try:
             from heading import GyroMPU
             self.gyro = GyroMPU(sample_rate=50.0)
-            if not self.gyro.is_connected():
+            if self.gyro.is_connected():
+                # Calibrate the gyro bias at boot (kart MUST be still), else the
+                # integrated yaw drifts and every heading is wrong. Re-run any
+                # time with the `calibrate_imu` command.
+                print("[gyro] calibrating bias -- keep the kart STILL...")
+                self.gyro.calibrate()
+            else:
                 print("[gyro] MPU6050 not detected; heading falls back to encoders")
         except Exception as e:                      # noqa: BLE001
             print(f"[gyro] unavailable ({e}); heading falls back to encoders")
@@ -125,6 +131,7 @@ class Server:
         r.register('turn',           self._h_turn)
         r.register('goto',           self._h_goto)
         r.register('reset_odometry', self._h_reset_odometry)
+        r.register('calibrate_imu',  self._h_calibrate_imu)
         r.register('set_sign',       self._h_set_sign)
         r.register('servo',          self._h_servo)
         r.register('led',            self._h_led)
@@ -460,6 +467,14 @@ class Server:
 
     def _h_reset_odometry(self, c: Command):
         self.drive.reset_odometry()
+
+    def _h_calibrate_imu(self, c: Command):
+        """Re-estimate the gyro bias (kart must be still). Runs off-thread so the
+        command returns immediately."""
+        if self.gyro is None:
+            return
+        threading.Thread(target=self.gyro.calibrate, daemon=True,
+                         name="GyroCalibrate").start()
 
     def _h_set_sign(self, c: Command):
         """Flip encoder count sign(s) at runtime (calibration).

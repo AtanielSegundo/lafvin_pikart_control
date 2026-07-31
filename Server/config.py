@@ -120,7 +120,7 @@ class HeadingGains:
     # The motor driver clamps duty to +/-4095 (and duty 0 is an active brake,
     # which helps it stop). Tune on hardware.
     turn_max_duty : float = 4095.0   # raw PWM far from the target
-    turn_min_duty : float = 3000.0   # raw PWM inside the slow zone near target
+    turn_min_duty : float = 3800.0   # raw PWM inside the slow zone near target
     slow_zone     : float = 0.26     # rad (~15 deg): where duty drops to min
     tolerance     : float = 0.05     # rad (~3 deg) arrival window
     max_time      : float = 6.0      # s, safety timeout per turn

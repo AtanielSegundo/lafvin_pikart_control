@@ -219,10 +219,13 @@ class DriveController:
             self._engaged = True
 
     def _read_gyro_yaw(self):
-        """Latest gyro yaw in radians, or None if no gyro / disconnected."""
+        """Latest gyro yaw in radians (mounting sign/axis applied by GyroMPU),
+        or None if no gyro / disconnected."""
         if self.gyro is None or not self.gyro.is_connected():
             return None
         try:
+            if hasattr(self.gyro, "get_yaw"):
+                return math.radians(self.gyro.get_yaw())
             return math.radians(self.gyro.get_angles_gyro()["z"])
         except Exception:                                       # noqa: BLE001
             return None
@@ -470,8 +473,7 @@ class DriveController:
                             self._heading_target = None
                     duty_left = duty_right = 0.0
                     heading_info = None
-            # A pure spin has ~0 net-forward duty, so the guard won't veto it;
-            # applied for consistency (and to stop a lopsided turn into a wall).
+            
             if self._front_blocked(duty_left, duty_right):
                 duty_left = duty_right = 0.0
                 guard_blocked = True

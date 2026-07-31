@@ -36,7 +36,15 @@ MPU6050_ADDR = 0x68        # 0x69 if AD0 is tied high
 MPU6050_SDA  = 0           # GPIO0 (physical pin 27) -> SDA0
 MPU6050_SCL  = 1           # GPIO1 (physical pin 28) -> SCL0
 I2C_BUS      = 0           # /dev/i2c-0  (GPIO0/1)
-SAMPLE_HZ    = 2.0         # readings per second
+SAMPLE_HZ    = 50.0        # integration rate (Hz). Keep high for turns.
+
+# Which integrated axis is the robot's YAW, and its sign, given how the board is
+# mounted. Run Scripts/try_mpu6050.py, turn the kart CCW (left) by hand, and see
+# which gyro axis changes and in which direction: set YAW_AXIS to it and
+# YAW_SIGN = +1 if it goes POSITIVE for a CCW turn, else -1. Getting this wrong
+# makes turns spin the wrong way / never converge and the odometry heading wrong.
+YAW_AXIS = "z"
+YAW_SIGN = 1
 
 GRAVITY_MS2  = 9.80665     # accel magnitude at rest; used to reject motion
 CAL_CACHE    = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -58,11 +66,15 @@ class GyroMPU:
                  gyro_range:  int = mpu6050.GYRO_RANGE_250DEG,
                  filter_bw:   int = mpu6050.FILTER_BW_256,
                  comp_alpha:  float = 0.98,      # gyro weight in the x/y filter
+                 yaw_axis:    str = YAW_AXIS,     # which integrated axis is yaw
+                 yaw_sign:    int = YAW_SIGN,     # +1 if that axis is + for CCW
                  cache_path:  str = CAL_CACHE):
-        
+
         self.sample_rate = max(1.0, float(sample_rate))
         self._period = 1.0 / self.sample_rate
         self.comp_alpha = comp_alpha
+        self.yaw_axis = yaw_axis
+        self.yaw_sign = yaw_sign
         self._cache_path = cache_path
 
         # Desired sensor config, kept so a reconnect can re-apply it.
@@ -312,6 +324,13 @@ class GyroMPU:
         Consumed by external agents; the thread keeps it fresh."""
         with self._lock:
             return dict(self.angles)
+
+    def get_yaw(self):
+        """Signed robot YAW in degrees (the configured axis * sign). This is the
+        heading source for the drive controller / odometry -- use it instead of
+        get_angles_gyro()['z'] so a mounting flip is fixed in one place."""
+        with self._lock:
+            return self.yaw_sign * self.angles[self.yaw_axis]
 
     def reset(self):
         """Zero the angles; re-seed roll/pitch from gravity if available."""
