@@ -111,13 +111,19 @@ class PositionGains:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class HeadingGains:
-    turn_kp_duty   : float = 6000.0  # duty per rad of heading error
-    turn_min_duty  : float = 1500.0  # stiction floor: keep turning (all four
-                                     # wheels must scrub) until within tolerance
-    turn_max_duty  : float = 2600.0  # cap on turn duty
-    turn_decel_gain: float = 3500.0  # decel ceiling: duty <= gain*sqrt(err_rad)
-    tolerance      : float = 0.035   # rad (~2 deg) arrival window
-    max_time       : float = 6.0     # s, safety timeout per turn
+    # RAW-PWM bang-bang turn -- the duty does NOT scale with the error/distance:
+    #   |err| > slow_zone       -> turn_max_duty   (full power, breaks stiction)
+    #   tolerance < |err| <= sz -> turn_min_duty   (gentler, limits overshoot)
+    # The turn STOPS the instant |err| < tolerance OR it crosses the target
+    # (sign flip), so a fast turn that skips the tolerance window still stops
+    # cleanly. Set turn_min_duty == turn_max_duty for a single raw level.
+    # The motor driver clamps duty to +/-4095 (and duty 0 is an active brake,
+    # which helps it stop). Tune on hardware.
+    turn_max_duty : float = 4095.0   # raw PWM far from the target
+    turn_min_duty : float = 3000.0   # raw PWM inside the slow zone near target
+    slow_zone     : float = 0.26     # rad (~15 deg): where duty drops to min
+    tolerance     : float = 0.05     # rad (~3 deg) arrival window
+    max_time      : float = 6.0      # s, safety timeout per turn
 
 
 # ---------------------------------------------------------------------------

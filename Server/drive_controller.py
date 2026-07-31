@@ -118,6 +118,7 @@ class DriveController:
         # Gyro heading turn: absolute target yaw (rad) or None when inactive.
         self._heading_target = None
         self._heading_time   = clock()
+        self._heading_prev_err = None         # for cross-target stop detection
         self._gyro_yaw       = 0.0            # latest gyro yaw (rad), for telem
         self._gyro_yaw_prev  = None           # for per-step d_theta
         self._goto        = None              # active go-to-pose job, if any
@@ -228,6 +229,7 @@ class DriveController:
 
     def _start_heading(self, target_yaw: float) -> None:
         """Engage a gyro-closed turn to an absolute yaw (radians)."""
+        self._heading_prev_err = None         # fresh cross-target detector
         with self._lock:
             self._move = None
             self._heading_target = target_yaw
@@ -236,20 +238,23 @@ class DriveController:
 
     def _heading_duty(self, target_yaw: float, yaw: float,
                       elapsed: float) -> "tuple[float, float, bool]":
-        """One gyro-turn iteration -> (duty_left, duty_right, done). Commands
-        DUTY directly: a proportional magnitude, capped, decelerated near the
-        target, then floored at turn_min_duty so it never stalls short. `error`
-        is NOT wrapped, so it turns the full commanded amount. Done when within
-        tolerance or on a safety timeout."""
+        """One gyro-turn iteration -> (duty_left, duty_right, done).
+
+        RAW-PWM bang-bang: the duty does NOT scale with the error, so it never
+        droops below stiction near the target. Full ``turn_max_duty`` until the
+        slow zone, then a fixed ``turn_min_duty`` for a gentler finish. `error`
+        is NOT wrapped, so it turns the full commanded amount. Stops when within
+        tolerance, when it CROSSES the target (sign flip -- catches a fast turn
+        that skips the window), or on a safety timeout.
+        """
         hg = self.config.heading
         error = target_yaw - yaw
-        if abs(error) < hg.tolerance or elapsed >= hg.max_time:
+        prev = self._heading_prev_err
+        self._heading_prev_err = error
+        crossed = prev is not None and prev != 0.0 and (prev > 0.0) != (error > 0.0)
+        if abs(error) < hg.tolerance or crossed or elapsed >= hg.max_time:
             return 0.0, 0.0, True
-        mag = hg.turn_kp_duty * abs(error)
-        mag = min(mag, hg.turn_max_duty)
-        if hg.turn_decel_gain > 0.0:
-            mag = min(mag, hg.turn_decel_gain * math.sqrt(abs(error)))
-        mag = max(mag, hg.turn_min_duty)
+        mag = hg.turn_max_duty if abs(error) > hg.slow_zone else hg.turn_min_duty
         # +ccw (error > 0): left side backward, right side forward.
         return (-mag, mag, False) if error > 0.0 else (mag, -mag, False)
 
