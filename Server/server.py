@@ -86,10 +86,21 @@ class Server:
         # --- conexão de comandos ativa (usada por send()) ---
         self.connection1      = None
 
+        # --- MPU6050 heading (gyro): ground truth for rotation. Optional. ---
+        try:
+            from heading import GyroMPU
+            self.gyro = GyroMPU(sample_rate=50.0)
+            if not self.gyro.is_connected():
+                print("[gyro] MPU6050 not detected; heading falls back to encoders")
+        except Exception as e:                      # noqa: BLE001
+            print(f"[gyro] unavailable ({e}); heading falls back to encoders")
+            self.gyro = None
+
         # --- closed-loop drivetrain (encoders + odometry + PID) ---
         self.encoders  = WheelEncoders(CONFIG.sides)
-        self.drive     = DriveController(self.PWM, self.encoders, 
-                                         config=CONFIG, dist_sensor=self.ultrasonic)
+        self.drive     = DriveController(self.PWM, self.encoders,
+                                         config=CONFIG, dist_sensor=self.ultrasonic,
+                                         gyro=self.gyro)
         self._rotate_thread = None
         try:
             self.drive.start()   # begins encoder listening + control loop
@@ -112,6 +123,7 @@ class Server:
         r.register('drive',          self._h_drive)
         r.register('drive_distance', self._h_drive_distance)
         r.register('turn',           self._h_turn)
+        r.register('goto',           self._h_goto)
         r.register('reset_odometry', self._h_reset_odometry)
         r.register('set_sign',       self._h_set_sign)
         r.register('servo',          self._h_servo)
@@ -435,6 +447,16 @@ class Server:
         angle = c.num('angle', 0, 0.0)
         speed = c.num('speed', 1, 1.0)
         self.drive.turn_in_place(angle, speed)
+
+    def _h_goto(self, c: Command):
+        """Go to world pose (x, y[, theta_deg]) -- turn, drive, turn."""
+        if self.Mode != 'one':
+            return
+        x = c.num('x', 0, 0.0)
+        y = c.num('y', 1, 0.0)
+        theta = c.get('theta')
+        theta = float(theta) if theta is not None else None
+        self.drive.goto_pose(x, y, theta)
 
     def _h_reset_odometry(self, c: Command):
         self.drive.reset_odometry()

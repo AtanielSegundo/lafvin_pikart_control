@@ -33,6 +33,7 @@ ALIASES: Dict[str, str] = {
     "drive": "drive",                       # closed-loop velocity (new)
     "drive_distance": "drive_distance",     # closed-loop distance (new)
     "turn": "turn",                         # closed-loop in-place turn (new)
+    "goto": "goto",                         # go to pose (x, y, theta) (new)
     "reset_odometry": "reset_odometry",     # (new)
     "set_sign": "set_sign",                 # runtime encoder sign flip (new)
     # peripherals

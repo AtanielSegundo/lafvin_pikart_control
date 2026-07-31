@@ -34,41 +34,56 @@ import math
 
 from config import CONFIG, RobotConfig
 from kinematics import SkidSteerKinematics, Twist, WheelSpeeds
-from odometry import Pose, SkidSteerOdometry
+from odometry import Pose, SkidSteerOdometry, wrap_angle
 from pid import PID
 
 from collections import deque
 
 if TYPE_CHECKING:
-    # Import for type hints only: Ultrasonic pulls in RPi.GPIO, which is absent
-    # off-Pi. `from __future__ import annotations` keeps the annotation lazy, so
-    # the controller still imports (and unit-tests run) on a laptop/CI.
+    # Import for type hints only: Ultrasonic pulls in RPi.GPIO and GyroMPU pulls
+    # in mpu6050, both absent off-Pi. `from __future__ import annotations` keeps
+    # the annotations lazy, so the controller still imports (unit-tests run) on
+    # a laptop/CI.
     from Ultrasonic import Ultrasonic
+    from heading import GyroMPU
 
 def _clamp(value: float, limit: float) -> float:
     return max(-limit, min(limit, value))
 
 
-def _stiction_floor(duty: float, remaining: float, gains) -> float:
-    """Keep a not-yet-arrived position command above the motor's move threshold.
+def _shape_move_duty(duty: float, remaining: float, speed: float, gains) -> float:
+    """Shape one side's position-PID duty for a smooth, low-overshoot stop.
 
-    The position PID output is ~kp*error, so it shrinks as the wheel nears its
-    target and eventually falls below the PWM the motor needs to move at all --
-    the wheel then stalls a few mm short and hums until the safety timeout.
-    While the side is still outside `tolerance`, floor the magnitude at
-    `min_move_duty` (sign preserved, so reverse moves get -min_move_duty).
+    Two effects, sign preserved:
+
+    1. Deceleration ceiling: cap |duty| at ``decel_gain * sqrt(|remaining|)`` so
+       the approach follows v ~ sqrt(2*a*d) -- it cruises at the PID/output_limit
+       far out, then slows as it nears the target. This is what removes the
+       momentum overshoot AND keeps the final approach slow enough that the
+       encoders don't drop counts.
+
+    2. Anti-stall floor: keep |duty| >= ``min_move_duty`` ONLY when the wheel has
+       nearly stopped (``|speed| < stop_speed``) while still short of the target.
+       Decoupling the floor from the fast approach means it no longer *forces*
+       speed into the target (the old cause of overshoot) -- it only unsticks a
+       side that stalled a few mm short.
     """
-    if gains.min_move_duty <= 0 or duty == 0.0:
-        return duty
-    if abs(remaining) <= gains.tolerance:
-        return duty
-    return math.copysign(max(abs(duty), gains.min_move_duty), duty)
+    if duty == 0.0:
+        return 0.0
+    mag = abs(duty)
+    if gains.decel_gain > 0.0:
+        mag = min(mag, gains.decel_gain * math.sqrt(max(0.0, abs(remaining))))
+    if (gains.min_move_duty > 0.0 and abs(remaining) > gains.tolerance
+            and abs(speed) < gains.stop_speed):
+        mag = max(mag, gains.min_move_duty)
+    return math.copysign(mag, duty)
 
 
 class DriveController:
     def __init__(self, motor, encoders, config: RobotConfig = CONFIG,
                  clock: Callable[[], float] = time.monotonic,
                  dist_sensor:Ultrasonic = None,
+                 gyro: "Optional[GyroMPU]" = None,
                  plant: "Optional[SimulatedDrivePlant]" = None):
         self.motor       = motor
         self.encoders    = encoders
@@ -76,6 +91,7 @@ class DriveController:
         self._clock      = clock
         self.plant       = plant
         self.dist_sensor = dist_sensor
+        self.gyro        = gyro          # MPU6050 heading source (may be None)
 
         self.kin  = SkidSteerKinematics(config.wheel)
         self.odom = SkidSteerOdometry(config.wheel)
@@ -94,10 +110,21 @@ class DriveController:
         self.pos_right = PID(pg.kp, pg.ki, pg.kd, 0.0,
                              pg.output_limit, pg.integral_limit)
 
+        # Heading PID (gyro-closed turn): error in RAD -> angular vel (rad/s).
+        hg = config.heading
+        self.heading_pid = PID(hg.kp, hg.ki, hg.kd, 0.0,
+                               hg.output_limit, hg.integral_limit)
+
         self._target      = Twist()
         self._target_time = clock()
         self._engaged     = False
         self._move        = None              # active position move, if any
+        # Gyro heading turn: absolute target yaw (rad) or None when inactive.
+        self._heading_target = None
+        self._heading_time   = clock()
+        self._gyro_yaw       = 0.0            # latest gyro yaw (rad), for telem
+        self._gyro_yaw_prev  = None           # for per-step d_theta
+        self._goto        = None              # active go-to-pose job, if any
         self._lock        = threading.Lock()
 
         self._thread      : Optional[threading.Thread] = None
@@ -129,6 +156,8 @@ class DriveController:
             linear = 0.0
         with self._lock:
             self._move = None
+            self._heading_target = None       # teleop overrides a heading turn
+            self._goto = None                 # ...and cancels a go-to-pose job
         self._apply_target(linear, angular)
 
     def set_wheel_speeds(self, left: float, right: float) -> None:
@@ -144,11 +173,14 @@ class DriveController:
         with self._lock:
             self._engaged = False
             self._move = None
+            self._heading_target = None
+            self._goto = None
             self._target = Twist()
         self.pid_left.reset()
         self.pid_right.reset()
         self.pos_left.reset()
         self.pos_right.reset()
+        self.heading_pid.reset()
 
     # -- high-level moves (per-side POSITION control) ----------------------
     def drive_distance(self, distance: float, speed: float = None) -> None:
@@ -169,12 +201,17 @@ class DriveController:
     def turn_in_place(self, angle_deg: float, ang_speed: float = None) -> None:
         """Rotate in place by ``angle_deg`` (positive = ccw) and stop.
 
-        A ccw turn of angle a rotates the body by a = (s_right - s_left)/track
-        with s_left = -s, s_right = +s, so each side must travel
-        s = a * track / 2 in opposite directions.
+        Preferred path: close the loop on the MPU6050 gyro yaw (ground truth,
+        slip-immune) with the heading PID. If no gyro is connected, fall back to
+        the encoder-distance turn: a ccw turn of angle a needs each side to
+        travel s = a * track / 2 in opposite directions.
         """
-        s = math.radians(angle_deg) * self.config.wheel.track / 2.0
-        self._start_move(-s, s)
+        yaw = self._read_gyro_yaw()
+        if yaw is not None:
+            self._start_heading(yaw + math.radians(angle_deg))
+        else:
+            s = math.radians(angle_deg) * self.config.wheel.track / 2.0
+            self._start_move(-s, s)
 
     def _start_move(self, target_left: float, target_right: float) -> None:
         self.pos_left.reset()
@@ -182,11 +219,102 @@ class DriveController:
         with self._lock:
             self._move = _PositionMove(target_left, target_right,
                                        self.config.position)
+            self._heading_target = None
             self._engaged = True
+
+    def _read_gyro_yaw(self):
+        """Latest gyro yaw in radians, or None if no gyro / disconnected."""
+        if self.gyro is None or not self.gyro.is_connected():
+            return None
+        try:
+            return math.radians(self.gyro.get_angles_gyro()["z"])
+        except Exception:                                       # noqa: BLE001
+            return None
+
+    def _start_heading(self, target_yaw: float) -> None:
+        """Engage a gyro-closed turn to an absolute yaw (radians)."""
+        self.heading_pid.reset()
+        with self._lock:
+            self._move = None
+            self._heading_target = target_yaw
+            self._heading_time = self._clock()
+            self._engaged = True
+
+    def _heading_step(self, dt: float, yaw: float) -> "tuple[Twist, bool]":
+        """One gyro-heading iteration: returns (target twist, done). Done when
+        within tolerance AND the turn has settled, or on a safety timeout."""
+        hg = self.config.heading
+        with self._lock:
+            target_yaw = self._heading_target
+            elapsed = self._clock() - self._heading_time
+        error = target_yaw - yaw
+        rate = self.odom.angular_velocity          # gyro-fed body rate (rad/s)
+        if (abs(error) < hg.tolerance and abs(rate) < hg.settle_rate) \
+                or elapsed >= hg.max_time:
+            return Twist(), True
+        angular = self.heading_pid.update(target_yaw, yaw, dt)   # rad/s, clamped
+        return Twist(0.0, angular), False
+
+    # -- go-to-pose (turn -> drive -> turn, on the gyro-accurate odometry) --
+    def goto_pose(self, x: float, y: float, theta_deg: float = None) -> None:
+        """Drive to world pose (x, y[, theta]). Executed as face-the-point ->
+        drive-straight -> turn-to-final-heading, each phase recomputed from the
+        live odometry pose. `theta_deg` (degrees) is optional; None leaves the
+        heading wherever the drive ends."""
+        with self._lock:
+            self._move = None
+            self._heading_target = None
+            self._goto = _Goto(x, y, theta_deg)
+            self._engaged = True
+
+    def _turn_to(self, rel_turn: float) -> None:
+        """Start a RELATIVE in-place turn of `rel_turn` rad -- gyro-closed when
+        available, else an encoder turn. Relative, so it is frame-independent."""
+        yaw = self._read_gyro_yaw()
+        if yaw is not None:
+            self._start_heading(yaw + rel_turn)
+        else:
+            s = rel_turn * self.config.wheel.track / 2.0
+            self._start_move(-s, s)
+
+    _GOTO_NEXT = {"start": "turn1", "turn1": "drive", "drive": "turn2",
+                  "turn2": "done"}
+
+    def _advance_goto(self) -> None:
+        """Advance the go-to-pose sequence to its next phase and start that
+        phase's move/turn (call only when no move or heading turn is running).
+        `phase` names the action now running, for telemetry."""
+        g = self._goto
+        if g is None:
+            return
+        pose = self.odom.pose
+        tol = self.config.position.tolerance
+        g.phase = self._GOTO_NEXT[g.phase]
+        if g.phase == "turn1":                    # face the target point
+            dx, dy = g.x - pose.x, g.y - pose.y
+            if math.hypot(dx, dy) < tol:
+                return self._advance_goto()       # already there -> skip
+            self._turn_to(wrap_angle(math.atan2(dy, dx) - pose.theta))
+        elif g.phase == "drive":                  # drive straight to it
+            dist = math.hypot(g.x - pose.x, g.y - pose.y)
+            if dist < tol:
+                return self._advance_goto()
+            self._start_move(dist, dist)
+        elif g.phase == "turn2":                  # settle on the final heading
+            if g.theta is None:
+                return self._advance_goto()
+            self._turn_to(wrap_angle(math.radians(g.theta) - pose.theta))
+        else:                                     # "done"
+            self._goto = None
 
     def move_active(self) -> bool:
         with self._lock:
-            return self._move is not None
+            return (self._move is not None or self._heading_target is not None
+                    or self._goto is not None)
+
+    def heading_active(self) -> bool:
+        with self._lock:
+            return self._heading_target is not None
 
     # Backwards-compatible alias.
     goal_active = move_active
@@ -222,25 +350,46 @@ class DriveController:
         if dt <= 0.0:
             dt = 1.0 / self.config.control.loop_hz
 
-        # 1. Feedback: mean count deltas per side since the last step.
+        # 1. Feedback: encoder deltas (translation) + gyro yaw (rotation).
         d_counts_left, d_counts_right = self.encoders.read_reset_sides()
-        
+
         mpc = self.config.wheel.meters_per_count
-        
         d_left = d_counts_left * mpc
         d_right = d_counts_right * mpc
-        
-        self.odom.update_from_distances(d_left, d_right, dt)
+
+        # Gyro yaw -> per-step d_theta (rad). Ground truth when connected;
+        # odometry falls back to the encoder differential when it is None.
+        gyro_yaw = self._read_gyro_yaw()
+        gyro_dtheta = None
+        if gyro_yaw is not None:
+            self._gyro_yaw = gyro_yaw
+            if self._gyro_yaw_prev is not None:
+                gyro_dtheta = gyro_yaw - self._gyro_yaw_prev
+            self._gyro_yaw_prev = gyro_yaw
+        else:
+            self._gyro_yaw_prev = None       # reset so a reconnect doesn't jump
+
+        self.odom.update_from_distances(d_left, d_right, dt, d_theta=gyro_dtheta)
         measured = WheelSpeeds(left=d_left / dt, right=d_right / dt)
 
-        # 2. Choose control mode: a position MOVE takes priority; otherwise
-        #    fall back to velocity control (teleop / `drive`).
+        # Advance a go-to-pose job when the current phase's move/turn finished;
+        # this starts the next move/heading, picked up by the dispatch below.
+        if self._goto is not None:
+            with self._lock:
+                busy = self._move is not None or self._heading_target is not None
+            if not busy:
+                self._advance_goto()
+
+        # 2. Choose control mode: a position MOVE takes priority; otherwise a
+        #    gyro heading turn; otherwise velocity control (teleop / `drive`).
         with self._lock:
             move = self._move
+            heading_running = self._heading_target is not None
 
         target = Twist()
         wheel_target = WheelSpeeds()
         move_info = None
+        heading_info = None
         guard_blocked = False
 
         if move is not None:
@@ -251,11 +400,12 @@ class DriveController:
             duty_right = self.pos_right.update(move.target_right,
                                                move.traveled_right, dt)
             err_l, err_r = move.errors()
-            # Deadband/stiction compensation so a nearly-arrived side doesn't
-            # stall short below the motor's move threshold.
-        
-            duty_left = _stiction_floor(duty_left, err_l, self.config.position)
-            duty_right = _stiction_floor(duty_right, err_r, self.config.position)
+            # Decelerate into the target (low overshoot, encoder-safe) and floor
+            # only a side that has stalled short.
+            duty_left = _shape_move_duty(duty_left, err_l, measured.left,
+                                         self.config.position)
+            duty_right = _shape_move_duty(duty_right, err_r, measured.right,
+                                          self.config.position)
         
             if move.is_done(measured.left, measured.right):
                 duty_left = duty_right = 0.0
@@ -294,8 +444,32 @@ class DriveController:
                                      int(round(duty_right)), int(round(duty_right)))
             
         else:
-            # --- VELOCITY control ---
-            target, engaged = self._current_target()
+            # --- pick the velocity target: gyro heading turn or teleop ---
+            if heading_running:
+                if gyro_yaw is None:
+                    # Gyro dropped mid-turn: abort safely (stop, drop the turn).
+                    with self._lock:
+                        self._heading_target = None
+                    self.heading_pid.reset()
+                    target, engaged = Twist(), True
+                else:
+                    target, done = self._heading_step(dt, gyro_yaw)
+                    engaged = True
+                    with self._lock:
+                        tgt = self._heading_target
+                    if tgt is not None:
+                        heading_info = {
+                            "target_deg": round(math.degrees(tgt), 2),
+                            "error_deg": round(math.degrees(tgt - gyro_yaw), 2)}
+                    if done:
+                        with self._lock:
+                            self._heading_target = None
+                        self.heading_pid.reset()
+                        target, heading_info = Twist(), None
+            else:
+                target, engaged = self._current_target()
+
+            # --- shared VELOCITY control ---
             wheel_target = self.kin.inverse(target)
             if engaged:
                 if target.linear == 0.0 and target.angular == 0.0:
@@ -325,6 +499,13 @@ class DriveController:
             self.plant.step(duty_left, duty_right, dt)
 
         # 4. Publish telemetry.
+        with self._lock:
+            heading_now = self._heading_target is not None
+            g = self._goto
+        goto_info = (None if g is None else
+                     {"phase": g.phase, "x": round(g.x, 3), "y": round(g.y, 3),
+                      "theta": g.theta})
+        gyro_connected = self.gyro is not None and self.gyro.is_connected()
         snapshot = {
             "pose": self.odom.pose.as_dict(),
             "twist": {"linear": round(self.odom.linear_velocity, 4),
@@ -338,8 +519,13 @@ class DriveController:
             "engaged": engaged,
             "guard_blocked": guard_blocked,
             "front_distance_cm": self.front_distance_cm,
-            "goal_active": move is not None,
+            "goal_active": (move is not None) or heading_now or (g is not None),
             "move": move_info,
+            "goto": goto_info,
+            "gyro": {"connected": gyro_connected,
+                     "yaw_deg": round(math.degrees(self._gyro_yaw), 2),
+                     "source": "gyro" if gyro_dtheta is not None else "encoder",
+                     "heading": heading_info},
             "encoders": self.encoders.raw_totals(),   # raw per-motor counts
         }
         with self._lock:
@@ -448,6 +634,9 @@ class DriveController:
             "front_distance_cm": None,
             "goal_active": False,
             "move": None,
+            "goto": None,
+            "gyro": {"connected": False, "yaw_deg": 0.0,
+                     "source": "encoder", "heading": None},
             "encoders": {},
         }
 
@@ -456,6 +645,19 @@ def _twist_from_wheels(kin: SkidSteerKinematics, left: float,
                        right: float) -> tuple[float, float]:
     t = kin.forward(WheelSpeeds(left=left, right=right))
     return t.linear, t.angular
+
+
+class _Goto:
+    """A go-to-pose job run as turn -> drive -> turn. Each phase is recomputed
+    from the live odometry pose, so heading/translation error does not build up
+    across phases. `theta` (degrees) is the optional final heading."""
+
+    def __init__(self, x: float, y: float, theta: float = None):
+        self.x = x
+        self.y = y
+        self.theta = theta
+        # start -> turn1 -> drive -> turn2 -> done (then _goto is cleared).
+        self.phase = "start"
 
 
 class _PositionMove:

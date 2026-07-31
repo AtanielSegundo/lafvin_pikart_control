@@ -71,10 +71,9 @@ class GyroMPU:
         self._filter_bw = filter_bw
 
         self.port = None
-        self.connected = False          # <-- health flag for external consumers
+        self.connected = False          
         self.calibrated = False
 
-        # Integrated angles (degrees) + gyro bias (deg/s). `heading` aliases yaw.
         self.angles = {"x": 0.0, "y": 0.0, "z": 0.0}
         self.gyro_bias = {"x": 0.0, "y": 0.0, "z": 0.0}
         self.heading = 0.0
@@ -109,8 +108,8 @@ class GyroMPU:
 
     def set_configs(self, accel_range, gyro_range, filter_bw):
         self._accel_range = accel_range
-        self._gyro_range = gyro_range
-        self._filter_bw = filter_bw
+        self._gyro_range  = gyro_range
+        self._filter_bw   = filter_bw
         if not self.port:
             return False
         try:

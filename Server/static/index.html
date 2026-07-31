@@ -187,6 +187,19 @@ canvas.joystick {
       <div class="qbtn" onclick="sendHeading()">Turn to</div>
     </div>
 
+    <!-- Go to pose (x, y, theta) -->
+    <div class="slider-row" style="padding:0;gap:6px;">
+      <label style="min-width:64px;">Go to</label>
+      <input type="number" id="gotoX" value="0" step="0.1" placeholder="x"
+             style="width:56px;background:#16213e;color:#eee;border:1px solid #444;border-radius:6px;padding:8px;">
+      <input type="number" id="gotoY" value="0" step="0.1" placeholder="y"
+             style="width:56px;background:#16213e;color:#eee;border:1px solid #444;border-radius:6px;padding:8px;">
+      <input type="number" id="gotoT" value="0" step="5" placeholder="&deg;"
+             style="width:56px;background:#16213e;color:#eee;border:1px solid #444;border-radius:6px;padding:8px;">
+      <span style="font-size:12px;color:#888;">m,m,&deg;</span>
+      <div class="qbtn" onclick="sendGoto()">Go</div>
+    </div>
+
     <!-- Encoder signs + live raw counts -->
     <div>
       <div style="font-size:12px;color:#888;margin-bottom:6px;">
@@ -594,6 +607,15 @@ function sendHeading() {
   const target = parseFloat(document.getElementById('headInput').value) || 0;
   const delta = wrapDeg(target - lastTheta);   // absolute heading -> relative turn
   send(JSON.stringify({ type: 'turn', angle: +delta.toFixed(1) }));
+}
+
+function sendGoto() {
+  const x = parseFloat(document.getElementById('gotoX').value) || 0;
+  const y = parseFloat(document.getElementById('gotoY').value) || 0;
+  const t = document.getElementById('gotoT').value;
+  const msg = { type: 'goto', x: +x.toFixed(3), y: +y.toFixed(3) };
+  if (t !== '') msg.theta = +parseFloat(t).toFixed(1);   // optional final heading
+  send(JSON.stringify(msg));
 }
 
 // --- Encoder-sign calibration ---

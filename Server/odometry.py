@@ -75,15 +75,21 @@ class SkidSteerOdometry:
         self.angular_velocity = 0.0
 
     def update_from_distances(self, d_left: float, d_right: float,
-                              dt: float) -> Pose:
+                              dt: float, d_theta: float | None = None) -> Pose:
         """Advance the pose given per-side distances travelled (metres).
 
         Integrates the step as an exact constant-curvature arc about the ICC
         (Dudek & Jenkin eq. 4-5), falling back to the straight-line limit as
         d_theta -> 0 to avoid the R = d_center / d_theta singularity.
+
+        Translation (d_center) always comes from the encoders. Rotation uses the
+        caller-supplied ``d_theta`` (radians) when given -- e.g. an MPU6050 gyro
+        delta, treated as ground truth -- otherwise it falls back to the encoder
+        differential (d_right - d_left) / track.
         """
         d_center = (d_right + d_left) / 2.0
-        d_theta = (d_right - d_left) / self.track
+        if d_theta is None:
+            d_theta = (d_right - d_left) / self.track
         theta = self.pose.theta
 
         if abs(d_theta) < 1e-9:

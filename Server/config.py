@@ -76,12 +76,42 @@ class PositionGains:
     ki: float = 2000.0       # gentle backstop for residual error; its
                              # contribution is bounded by integral_limit below
     kd: float = 1000.0       # duty per (m/s) — damping
-    output_limit  : float = 2000.0  # gentle duty cap during moves
+    output_limit  : float = 2000.0  # CRUISE duty cap. Keep within the rate the
+                                    # encoders can count -- at high duty (~3000)
+                                    # the wheel spins faster than the quadrature
+                                    # decoder tracks, counts are dropped, travel
+                                    # is under-reported and the move overshoots
+                                    # / never "arrives". Raise only if verified.
     integral_limit: float = 800.0
     tolerance     : float = 0.01    # m, arrival tolerance
     stop_speed    : float = 0.02    # m/s below which we consider it stopped
     max_time      : float = 12.0    # s, safety timeout per move
-    min_move_duty : float = 1200.0
+    min_move_duty : float = 1200.0  # anti-stall kick, applied ONLY when a side
+                                    # has nearly stopped short (not while moving)
+    # Deceleration ceiling: cap |duty| at decel_gain * sqrt(remaining_m) so the
+    # approach slows smoothly (v ~ sqrt(2*a*d)) instead of charging in at cruise
+    # duty and overshooting. Also keeps the final approach slow enough for the
+    # encoders. With output_limit 2000 this starts decelerating ~0.44 m out.
+    decel_gain    : float = 3000.0
+
+
+# ---------------------------------------------------------------------------
+# Heading-hold / turn-in-place PID, closed on the MPU6050 gyro yaw.
+# Error is in RADIANS of heading; output is an angular velocity (rad/s) that is
+# fed through the velocity controller (inverse kinematics -> wheel PID). Only
+# used when a gyro is present and connected; otherwise turns fall back to the
+# encoder-distance position move. Tune on hardware.
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class HeadingGains:
+    kp: float = 4.0          # (rad/s) per rad of heading error
+    ki: float = 0.5
+    kd: float = 0.2
+    output_limit  : float = 4.0     # rad/s; clamp to the platform max_angular
+    integral_limit: float = 1.0
+    tolerance     : float = 0.035   # rad (~2 deg) arrival window
+    settle_rate   : float = 0.17    # rad/s (~10 deg/s) below which "stopped"
+    max_time      : float = 8.0     # s, safety timeout per turn
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +218,7 @@ class RobotConfig:
     wheel   : WheelGeometry = field(default_factory=WheelGeometry)
     pid     : PIDGains      = field(default_factory=PIDGains)
     position: PositionGains = field(default_factory=PositionGains)
+    heading : HeadingGains  = field(default_factory=HeadingGains)
     sides   : SideMapping   = field(default_factory=SideMapping)
     control : ControlConfig = field(default_factory=ControlConfig)
     network : NetworkConfig = field(default_factory=NetworkConfig)
