@@ -104,10 +104,10 @@ class PositionGains:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class HeadingGains:
-    kp: float = 4.0          # (rad/s) per rad of heading error
-    ki: float = 0.5
-    kd: float = 0.2
-    output_limit  : float = 4.0     # rad/s; clamp to the platform max_angular
+    kp: float = 16.0          # (rad/s) per rad of heading error
+    ki: float = 1.0
+    kd: float = 2.0
+    output_limit  : float = 10.0     # rad/s; clamp to the platform max_angular
     integral_limit: float = 1.0
     tolerance     : float = 0.035   # rad (~2 deg) arrival window
     settle_rate   : float = 0.17    # rad/s (~10 deg/s) below which "stopped"
