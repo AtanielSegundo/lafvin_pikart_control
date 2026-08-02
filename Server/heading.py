@@ -26,6 +26,7 @@ Deps:  pip install mpu6050-raspberrypi
 import json
 import math
 import os
+from datetime import datetime
 import threading
 import time
 from dataclasses import dataclass
@@ -39,17 +40,13 @@ I2C_BUS      = 0           # /dev/i2c-0  (GPIO0/1)
 SAMPLE_HZ    = 50.0        # integration rate (Hz). Keep high for turns.
 
 # Which integrated axis is the robot's YAW, and its sign, given how the board is
-# mounted. Run Scripts/try_mpu6050.py, turn the kart CCW (left) by hand, and see
-# which gyro axis changes and in which direction: set YAW_AXIS to it and
-# YAW_SIGN = +1 if it goes POSITIVE for a CCW turn, else -1. Getting this wrong
-# makes turns spin the wrong way / never converge and the odometry heading wrong.
+# mounted.
 YAW_AXIS = "z"
 YAW_SIGN = 1
 
-GRAVITY_MS2  = 9.80665     # accel magnitude at rest; used to reject motion
-CAL_CACHE    = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            ".mpu6050_cal.json")
-
+GRAVITY_MS2  = 9.80665
+CAL_CACHE    = os.path.join(os.path.dirname(os.path.abspath(__file__)),".mpu6050_cal.json")
+CACHE_MAX_DAY_DELTA = 1
 
 @dataclass(frozen=True)
 class MPU6050_CFG:
@@ -58,17 +55,19 @@ class MPU6050_CFG:
     SCL  : int = 1  # GPIO1 -> SCL0
     I2C_BUS : int = 0  # /dev/i2c-0  (GPIO0/1)
 
-
 class GyroMPU:
     def __init__(self,
                  sample_rate: float = SAMPLE_HZ,
                  accel_range: int = mpu6050.ACCEL_RANGE_2G,
                  gyro_range:  int = mpu6050.GYRO_RANGE_250DEG,
                  filter_bw:   int = mpu6050.FILTER_BW_256,
-                 comp_alpha:  float = 0.98,      # gyro weight in the x/y filter
+                 comp_alpha:  float = 0.98,       # gyro weight in the x/y filter
                  yaw_axis:    str = YAW_AXIS,     # which integrated axis is yaw
                  yaw_sign:    int = YAW_SIGN,     # +1 if that axis is + for CCW
-                 cache_path:  str = CAL_CACHE):
+                 cache_path:  str = CAL_CACHE,
+                 max_reconect_tries:int = 16,
+                 retry_time_ms:float = 300,   # backoff between reconnect tries
+                ):
 
         self.sample_rate = max(1.0, float(sample_rate))
         self._period = 1.0 / self.sample_rate
@@ -76,26 +75,30 @@ class GyroMPU:
         self.yaw_axis = yaw_axis
         self.yaw_sign = yaw_sign
         self._cache_path = cache_path
+        self.max_reconect_tries = max_reconect_tries
+        self.reconect_trie_count = 0
+        self._retry_time = max(0.0, retry_time_ms / 1000.0)  # s, reconnect backoff
 
         # Desired sensor config, kept so a reconnect can re-apply it.
         self._accel_range = accel_range
-        self._gyro_range = gyro_range
-        self._filter_bw = filter_bw
+        self._gyro_range  = gyro_range
+        self._filter_bw   = filter_bw
 
-        self.port = None
-        self.connected = False          
+        self.port       = None
+        self.connected  = False
         self.calibrated = False
+        self.stoped     = False
 
         self.angles = {"x": 0.0, "y": 0.0, "z": 0.0}
         self.gyro_bias = {"x": 0.0, "y": 0.0, "z": 0.0}
         self.heading = 0.0
 
-        self._lock = threading.Lock()       # guards angles / bias / heading
-        self._io_lock = threading.Lock()    # serialises I2C access to the port
+        self._lock     = threading.Lock()   # guards angles / bias / heading
+        self._io_lock  = threading.Lock()   # serialises I2C access to the port
         self._stop_evt = threading.Event()
-        self._thread = None
+        self._thread   = None
 
-        self._load_cache()                  # restore last calibration if any
+        self._load_cache()  # restore last calibration if any
         self.init_mpu6050()
         if self.connected:
             self.set_configs(accel_range, gyro_range, filter_bw)
@@ -139,10 +142,18 @@ class GyroMPU:
     def _reconnect(self):
         """Re-open the device and re-apply configs; keep the cached bias and
         re-seed roll/pitch from gravity so angles don't jump on return."""
+        if self.reconect_trie_count >= self.max_reconect_tries:
+            self.stoped = True
+            return False
+        
         self.init_mpu6050()
         if self.connected:
+            self.reconect_trie_count = 0
             self.set_configs(self._accel_range, self._gyro_range, self._filter_bw)
             self._seed_from_accel()
+        else:
+            self.reconect_trie_count += 1
+        
         return self.connected
 
     def is_connected(self) -> bool:
@@ -228,10 +239,18 @@ class GyroMPU:
               f"rest pose roll={roll:+.2f} pitch={pitch:+.2f} deg")
         return True
 
+    @staticmethod
+    def _is_cache_valid(calibrated_at_timestamp:float) -> bool:
+        _last = datetime.fromtimestamp(calibrated_at_timestamp)
+        _now  = datetime.fromtimestamp(time.time())
+        return (_now - _last).days < CACHE_MAX_DAY_DELTA
+        
     def _load_cache(self):
         try:
             with open(self._cache_path) as f:
                 data = json.load(f)
+            if not self._is_cache_valid(data["calibrated_at"]):
+                return
             self.gyro_bias = {k: float(data["gyro_bias"][k]) for k in ("x", "y", "z")}
             self.calibrated = True
             print(f"[GyroMPU] loaded cached calibration: bias={self.gyro_bias}")
@@ -265,22 +284,24 @@ class GyroMPU:
     def _update_loop(self):
         last = time.monotonic()
         while not self._stop_evt.is_set():
+            if self.stoped:
+                break
+            
             start = time.monotonic()
 
             if not self.port:                       # (re)connect and re-config
                 self._reconnect()
                 if not self.connected:
-                    self._stop_evt.wait(1.0)        # backoff, then retry
+                    self._stop_evt.wait(self._retry_time)   # backoff, then retry
                     last = time.monotonic()
                     continue
-
             try:
                 gyro, accel = self._read_raw()
             except Exception as e:                  # noqa: BLE001 -- lost sensor
                 print(f"[GyroMPU] read failed ({e}); reconnecting...")
                 self.port = None
                 self.connected = False
-                self._stop_evt.wait(0.5)
+                self._stop_evt.wait(self._retry_time)
                 last = time.monotonic()
                 continue
 
