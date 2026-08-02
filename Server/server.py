@@ -130,6 +130,7 @@ class Server:
         r.register('drive_distance', self._h_drive_distance)
         r.register('turn',           self._h_turn)
         r.register('goto',           self._h_goto)
+        r.register('raw_turn_schedule', self._h_raw_turn_schedule)
         r.register('reset_odometry', self._h_reset_odometry)
         r.register('calibrate_imu',  self._h_calibrate_imu)
         r.register('set_sign',       self._h_set_sign)
@@ -464,6 +465,24 @@ class Server:
         theta = c.get('theta')
         theta = float(theta) if theta is not None else None
         self.drive.goto_pose(x, y, theta)
+
+    def _h_raw_turn_schedule(self, c: Command):
+        """Open-loop PWM turn run on the Pi (no per-step network latency); with
+        no gyro, it fakes the odometry heading each tick so telemetry reflects
+        the turn. `final_turn_angle` is a RELATIVE delta (deg): the heading ends
+        at start + final_turn_angle. JSON: turn_fn, ccw, pwm, min_pwm,
+        final_turn_angle, fn_params."""
+        if self.Mode != 'one':
+            return
+        turn_fn = str(c.get('turn_fn', 'trapezoid'))
+        ccw     = bool(c.get('ccw', True))
+        pwm     = int(c.num('pwm', 0, 2000))
+        min_pwm = int(c.num('min_pwm', 1, 1000))
+        final   = c.num('final_turn_angle', 2, 90.0)
+        params  = c.get('fn_params')
+        if not isinstance(params, dict):
+            params = {}
+        self.drive.raw_turn_schedule(turn_fn, ccw, pwm, min_pwm, final, params)
 
     def _h_reset_odometry(self, c: Command):
         self.drive.reset_odometry()

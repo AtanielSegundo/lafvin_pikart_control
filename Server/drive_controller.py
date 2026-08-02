@@ -79,6 +79,58 @@ def _shape_move_duty(duty: float, remaining: float, speed: float, gains) -> floa
     return math.copysign(mag, duty)
 
 
+def _lerp(a: float, b: float, frac: float) -> float:
+    return a + (b - a) * frac
+
+
+def _turn_profile_steps(turn_fn: str, pwm: int, min_pwm: int,
+                        params: dict) -> "list[tuple[int, float]]":
+    """Expand an open-loop turn profile into a list of (duty, dt) steps, run
+    SERVER-SIDE (no per-step network latency). Mirrors calibration.py.
+
+    turn_fn:
+      "std"       -- constant pwm for dt, sub-stepped (params: dt, steps)
+      "decayed"   -- linear ramp-down pwm->min (params: dt, N)
+      "trapezoid" -- ramp up / cruise / ramp down (params: dt, steps, ramp_frac)
+      "pulsed"    -- pwm bursts with brake gaps (params: on_s, off_s, n_pulses)
+    duty is the UNSIGNED magnitude; a 0 duty means brake (pulsed gaps). The
+    caller applies the ccw sign.
+    """
+    p = params or {}
+    if turn_fn == "std":
+        dt = float(p.get("dt", 0.5)); steps = max(1, int(p.get("steps", 20)))
+        return [(int(pwm), dt / steps)] * steps
+    if turn_fn == "decayed":
+        dt = float(p.get("dt", 0.5)); n = max(1, int(p.get("N", 10)))
+        return [(max(int(min_pwm), int(pwm * (1.0 - i / n))), dt / n)
+                for i in range(n)]
+    if turn_fn == "trapezoid":
+        dt = float(p.get("dt", 0.6)); steps = max(1, int(p.get("steps", 15)))
+        ramp_frac = max(0.0, min(0.5, float(p.get("ramp_frac", 0.3))))
+        step = dt / steps
+        t_up, t_dn = ramp_frac * dt, (1.0 - ramp_frac) * dt
+        seq = []
+        for i in range(steps):
+            t = i * step
+            if t_up > 0.0 and t < t_up:
+                duty = _lerp(min_pwm, pwm, t / t_up)
+            elif (dt - t_dn) > 0.0 and t > t_dn:
+                duty = _lerp(pwm, min_pwm, (t - t_dn) / (dt - t_dn))
+            else:
+                duty = pwm
+            seq.append((int(duty), step))
+        return seq
+    if turn_fn == "pulsed":
+        on_s = float(p.get("on_s", 0.08)); off_s = float(p.get("off_s", 0.06))
+        n = max(1, int(p.get("n_pulses", 8)))
+        seq = []
+        for _ in range(n):
+            seq.append((int(pwm), on_s))
+            seq.append((0, off_s))            # 0 = brake, wheels regain grip
+        return seq
+    raise ValueError(f"unknown turn_fn {turn_fn!r}")
+
+
 class DriveController:
     def __init__(self, motor, encoders, config: RobotConfig = CONFIG,
                  clock: Callable[[], float] = time.monotonic,
@@ -122,6 +174,10 @@ class DriveController:
         self._gyro_yaw       = 0.0            # latest gyro yaw (rad), for telem
         self._gyro_yaw_prev  = None           # for per-step d_theta
         self._goto        = None              # active go-to-pose job, if any
+        # Open-loop raw-turn: forced odometry heading (rad) while a scheduled
+        # PWM turn runs, or None. Lets telemetry reflect the turn with no gyro.
+        self._heading_override = None
+        self._raw_turn_thread: Optional[threading.Thread] = None
         self._lock        = threading.Lock()
 
         self._thread      : Optional[threading.Thread] = None
@@ -325,6 +381,69 @@ class DriveController:
     # Backwards-compatible alias.
     goal_active = move_active
 
+    # -- open-loop raw turn (no gyro): run a PWM profile server-side and force --
+    #    the odometry heading so telemetry reflects it. --------------------------
+    def _set_raw_turn(self, duty: int, ccw: bool) -> None:
+        """Drive an in-place spin at `duty` (0 = brake). ccw -> left back / right
+        forward, matching calibration.set_all_turn and the +ccw convention."""
+        d = int(duty)
+        if ccw:
+            self.motor.setMotorModel(-d, -d, d, d)
+        else:
+            self.motor.setMotorModel(d, d, -d, -d)
+
+    def raw_turn_schedule(self, turn_fn: str, ccw: bool, pwm: int, min_pwm: int,
+                          final_turn_angle: float, fn_params: dict = None) -> bool:
+        """Run an open-loop PWM turn profile SERVER-SIDE (no per-step network
+        latency) and, since there's no gyro, OVERWRITE the odometry heading each
+        tick -- interpolating from the current heading to
+        (current + `final_turn_angle`) over the profile's duration -- purely so
+        telemetry / the sim mirror reflect the turn. `final_turn_angle` is a
+        RELATIVE delta in degrees (the raw turn is a delta by nature), so the
+        heading ends at start + final_turn_angle; its sign sets the sweep
+        direction.
+
+        turn_fn: "std" | "decayed" | "trapezoid" | "pulsed" (see
+        _turn_profile_steps for fn_params). Returns False if a raw turn is
+        already running or turn_fn is unknown."""
+        if self._raw_turn_thread and self._raw_turn_thread.is_alive():
+            return False
+        try:
+            steps = _turn_profile_steps(turn_fn, int(pwm), int(min_pwm),
+                                        fn_params or {})
+        except ValueError as e:                                  # noqa: BLE001
+            print(f"[raw_turn] {e}")
+            return False
+        self._raw_turn_thread = threading.Thread(
+            target=self._run_raw_turn, args=(steps, bool(ccw),
+                                             float(final_turn_angle)),
+            daemon=True, name="RawTurn")
+        self._raw_turn_thread.start()
+        return True
+
+    def _run_raw_turn(self, steps, ccw: bool, final_deg: float) -> None:
+        self.release()                             # stop the PID fighting the duty
+        total = sum(dt for _, dt in steps) or 1e-9
+        start = self.odom.pose.theta               # rad, at turn start
+        delta = math.radians(final_deg)            # RELATIVE turn (delta), added
+        final = start + delta                      # to the heading at turn start
+        with self._lock:
+            self._heading_override = wrap_angle(start)
+        elapsed = 0.0
+        try:
+            for duty, dt in steps:
+                self._set_raw_turn(duty, ccw)
+                elapsed += dt
+                frac = min(1.0, elapsed / total)
+                with self._lock:                   # sweep the faked heading
+                    self._heading_override = wrap_angle(start + delta * frac)
+                time.sleep(dt)
+        finally:
+            self.motor.setMotorModel(0, 0, 0, 0)   # brake/stop
+            with self._lock:
+                self.odom.pose.theta = wrap_angle(final)   # land on the target
+                self._heading_override = None              # resume normal odom
+
     def _current_target(self) -> tuple[Twist, bool]:
         with self._lock:
             engaged = self._engaged
@@ -376,6 +495,13 @@ class DriveController:
             self._gyro_yaw_prev = None       # reset so a reconnect doesn't jump
 
         self.odom.update_from_distances(d_left, d_right, dt, d_theta=gyro_dtheta)
+        # Raw-turn heading override: a scheduled open-loop turn forces the odom
+        # heading (there's no gyro) so telemetry reflects the turn. Applied here
+        # -- the loop is the single writer of pose.theta.
+        with self._lock:
+            ov = self._heading_override
+        if ov is not None:
+            self.odom.pose.theta = ov
         measured = WheelSpeeds(left=d_left / dt, right=d_right / dt)
 
         # Advance a go-to-pose job when the current phase's move/turn finished;
