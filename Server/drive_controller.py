@@ -162,6 +162,10 @@ class DriveController:
         self.pos_right = PID(pg.kp, pg.ki, pg.kd, 0.0,
                              pg.output_limit, pg.integral_limit)
 
+        # Heading PID (gyro turn-in-place): error in RADIANS of yaw -> duty.
+        hg = config.heading
+        self.heading_pid = PID(hg.kp, hg.ki, hg.kd, 0.0,
+                               hg.output_limit, hg.integral_limit)
 
         self._target      = Twist()
         self._target_time = clock()
@@ -170,7 +174,9 @@ class DriveController:
         # Gyro heading turn: absolute target yaw (rad) or None when inactive.
         self._heading_target = None
         self._heading_time   = clock()
-        self._heading_prev_err = None         # for cross-target stop detection
+        self._heading_prev_yaw = None         # for the measured yaw rate
+        self._heading_settle   = 0            # consecutive in-window slow ticks
+        self._heading_pulse    = 0.0          # delta-sigma accumulator (floor)
         self._gyro_yaw       = 0.0            # latest gyro yaw (rad), for telem
         self._gyro_yaw_prev  = None           # for per-step d_theta
         self._goto        = None              # active go-to-pose job, if any
@@ -233,6 +239,7 @@ class DriveController:
         self.pid_right.reset()
         self.pos_left.reset()
         self.pos_right.reset()
+        self.heading_pid.reset()
 
     # -- high-level moves (per-side POSITION control) ----------------------
     def drive_distance(self, distance: float, speed: float = None) -> None:
@@ -288,34 +295,89 @@ class DriveController:
 
     def _start_heading(self, target_yaw: float) -> None:
         """Engage a gyro-closed turn to an absolute yaw (radians)."""
-        self._heading_prev_err = None         # fresh cross-target detector
+        self.heading_pid.reset()              # no integral/derivative carry-over
+        self._heading_prev_yaw = None
+        self._heading_settle   = 0
+        self._heading_pulse    = 0.0
         with self._lock:
             self._move = None
             self._heading_target = target_yaw
             self._heading_time = self._clock()
             self._engaged = True
 
-    def _heading_duty(self, target_yaw: float, yaw: float,
-                      elapsed: float) -> "tuple[float, float, bool]":
+    def _shape_turn_duty(self, duty: float, error: float) -> float:
+        """Shape the heading PID's duty for a stiction-limited skid turn.
+
+        1. Deceleration ceiling (mirrors :func:`_shape_move_duty`): cap |duty| at
+           ``decel_gain * sqrt(|error|)`` so the approach follows w ~ sqrt(2*a*th)
+           instead of charging in at the output limit.
+
+        2. Stiction floor, PULSED. Four wheels scrubbing sideways need about
+           ``min_turn_duty`` before they move at all, so a smaller PID demand
+           just hums. Raising it to the floor is what made the old turn
+           bang-bang, so instead fire the FULL floor duty on a fraction of ticks
+           equal to demand/floor (delta-sigma accumulator) and brake in between.
+           Average torque tracks the PID; each burst still breaks static
+           friction. ``pulse_floor = False`` reverts to a continuous floor.
+        """
+        if duty == 0.0:
+            return 0.0
+        hg = self.config.heading
+        mag = abs(duty)
+        if hg.decel_gain > 0.0:
+            mag = min(mag, hg.decel_gain * math.sqrt(max(0.0, abs(error))))
+        floor = hg.min_turn_duty
+        if floor > 0.0 and mag < floor:
+            if not hg.pulse_floor:
+                mag = floor
+            else:
+                self._heading_pulse += mag / floor
+                if self._heading_pulse >= 1.0:
+                    self._heading_pulse -= 1.0
+                    mag = floor
+                else:
+                    mag = 0.0                 # brake gap: wheels regain grip
+        return math.copysign(mag, duty)
+
+    def _heading_duty(self, target_yaw: float, yaw: float, elapsed: float,
+                      dt: float) -> "tuple[float, float, bool]":
         """One gyro-turn iteration -> (duty_left, duty_right, done).
 
-        RAW-PWM bang-bang: the duty does NOT scale with the error, so it never
-        droops below stiction near the target. Full ``turn_max_duty`` until the
-        slow zone, then a fixed ``turn_min_duty`` for a gentler finish. `error`
-        is NOT wrapped, so it turns the full commanded amount. Stops when within
-        tolerance, when it CROSSES the target (sign flip -- catches a fast turn
-        that skips the window), or on a safety timeout.
+        PID on the heading error (radians) -> per-side duty, shaped by
+        :meth:`_shape_turn_duty`. `error` is NOT wrapped, so a commanded 540 deg
+        turns 540 deg rather than 180.
+
+        Arrival needs BOTH |error| < tolerance AND |yaw rate| < settle_rate, held
+        for ``settle_ticks`` ticks, braking meanwhile. The rate half is what the
+        old bang-bang lacked: at 20 Hz a full-power turn sweeps far more than the
+        tolerance window per tick, so "inside the window" alone meant "about to
+        coast straight past it".
         """
         hg = self.config.heading
         error = target_yaw - yaw
-        prev = self._heading_prev_err
-        self._heading_prev_err = error
-        crossed = prev is not None and prev != 0.0 and (prev > 0.0) != (error > 0.0)
-        if abs(error) < hg.tolerance or crossed or elapsed >= hg.max_time:
+
+        # Measured yaw rate from consecutive samples (target is constant during a
+        # turn, so this is also -d(error)/dt, i.e. what the PID's D term sees).
+        prev_yaw = self._heading_prev_yaw
+        self._heading_prev_yaw = yaw
+        rate = 0.0 if (prev_yaw is None or dt <= 0.0) else (yaw - prev_yaw) / dt
+
+        if elapsed >= hg.max_time:
             return 0.0, 0.0, True
-        mag = hg.turn_max_duty if abs(error) > hg.slow_zone else hg.turn_min_duty
-        # +ccw (error > 0): left side backward, right side forward.
-        return (-mag, mag, False) if error > 0.0 else (mag, -mag, False)
+
+        if abs(error) < hg.tolerance:
+            # In the window: brake and wait for the spin to actually die down.
+            if abs(rate) < hg.settle_rate:
+                self._heading_settle += 1
+            else:
+                self._heading_settle = 0
+            return 0.0, 0.0, self._heading_settle >= hg.settle_ticks
+        self._heading_settle = 0
+
+        duty = self._shape_turn_duty(
+            self.heading_pid.update(target_yaw, yaw, dt), error)
+        # +ccw (duty > 0): left side backward, right side forward.
+        return -duty, duty, False
 
     # -- go-to-pose (turn -> drive -> turn, on the gyro-accurate odometry) --
     def goto_pose(self, x: float, y: float, theta_deg: float = None) -> None:
@@ -586,13 +648,17 @@ class DriveController:
                 # Gyro dropped mid-turn (or the turn was cancelled): stop safely.
                 with self._lock:
                     self._heading_target = None
+                self.heading_pid.reset()
                 duty_left = duty_right = 0.0
             else:
                 duty_left, duty_right, done = self._heading_duty(
-                    target_yaw, gyro_yaw, elapsed)
+                    target_yaw, gyro_yaw, elapsed, dt)
                 heading_info = {
                     "target_deg": round(math.degrees(target_yaw), 2),
-                    "error_deg": round(math.degrees(target_yaw - gyro_yaw), 2)}
+                    "error_deg": round(math.degrees(target_yaw - gyro_yaw), 2),
+                    "rate_dps": round(math.degrees(gyro_dtheta / dt), 1)
+                                if gyro_dtheta is not None else None,
+                    "duty": int(round(duty_right))}
                 if done:
                     with self._lock:
                         if self._heading_target == target_yaw:

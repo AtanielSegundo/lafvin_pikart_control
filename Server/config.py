@@ -96,34 +96,61 @@ class PositionGains:
 
 
 # ---------------------------------------------------------------------------
-# Turn-in-place closed on the MPU6050 gyro yaw. Error is in RADIANS of heading.
+# Turn-in-place closed on the MPU6050 gyro yaw. Error is in RADIANS of heading,
+# output is per-side PWM duty (left = -duty, right = +duty for a ccw turn).
 #
-# The turn commands per-side DUTY DIRECTLY (not an angular-velocity setpoint fed
-# through the wheel-speed loop). A velocity loop starves the motors at low
-# commanded speed near the target -- duty drops below stiction and the kart
-# stalls short, humming in place. Commanding duty with a floor guarantees the
-# four wheels always have enough torque to keep scrubbing until it arrives.
+# This is a real PID (Server/pid.py), NOT the old bang-bang profile. The old one
+# ran 4095 duty until |err| < 15 deg then 3800 until |err| < 3 deg, i.e. ~full
+# power right up to the target. At loop_hz=20 (50 ms/tick) a full-power in-place
+# skid turn sweeps ~10-20 deg PER TICK, so the 3 deg arrival window was never
+# observable -- every turn stopped on the cross-target sign flip, by definition
+# already past the target, and then coasted further on its own inertia. Hence
+# "aggressive, overshoots a lot".
 #
-# Profile per tick, magnitude clamped:  turn_kp_duty*|err|  ->  capped at
-# turn_max_duty  ->  decel ceiling turn_decel_gain*sqrt(|err|) near the target
-# ->  floored at turn_min_duty so it never stalls short. Only used with a live
-# gyro; otherwise turns fall back to the encoder-distance move. Tune on hardware.
+# The PID fixes the cause: duty now SCALES with the error, and kd (damping)
+# subtracts the measured yaw rate so the kart is already slow when it arrives.
+#
+# Per tick:  PID(err) -> decel ceiling decel_gain*sqrt(|err|) -> stiction floor
+# (pulsed, see below) -> arrival test. Only used with a live gyro; otherwise
+# turns fall back to the encoder-distance move. TUNE kp/kd ON HARDWARE.
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class HeadingGains:
-    # RAW-PWM bang-bang turn -- the duty does NOT scale with the error/distance:
-    #   |err| > slow_zone       -> turn_max_duty   (full power, breaks stiction)
-    #   tolerance < |err| <= sz -> turn_min_duty   (gentler, limits overshoot)
-    # The turn STOPS the instant |err| < tolerance OR it crosses the target
-    # (sign flip), so a fast turn that skips the tolerance window still stops
-    # cleanly. Set turn_min_duty == turn_max_duty for a single raw level.
-    # The motor driver clamps duty to +/-4095 (and duty 0 is an active brake,
-    # which helps it stop). Tune on hardware.
-    turn_max_duty : float = 4095.0   # raw PWM far from the target
-    turn_min_duty : float = 3800.0   # raw PWM inside the slow zone near target
-    slow_zone     : float = 0.26     # rad (~15 deg): where duty drops to min
-    tolerance     : float = 0.05     # rad (~3 deg) arrival window
-    max_time      : float = 6.0      # s, safety timeout per turn
+    kp: float = 6000.0        # duty per rad of heading error
+    ki: float = 1200.0        # gentle backstop for a residual degree or two;
+                              # bounded by integral_limit below
+    kd: float = 2400.0        # duty per (rad/s) -- damping. THE anti-overshoot
+                              # term: raise it if the kart still swings past,
+                              # lower it if the turn crawls or judders. It is
+                              # deliberately large -- it has to command REVERSE
+                              # duty to brake, since coasting alone carries the
+                              # kart tens of degrees past the target.
+    output_limit  : float = 3200.0   # max turn duty (was effectively 4095)
+    integral_limit: float = 600.0
+    # Deceleration ceiling, same idea as PositionGains.decel_gain: cap |duty| at
+    # decel_gain*sqrt(|err|) so the approach follows w ~ sqrt(2*a*theta).
+    decel_gain    : float = 3000.0
+    # Stiction floor: four wheels scrubbing sideways need roughly this much duty
+    # before they move at all, so any PID demand below it is a stall hum.
+    min_turn_duty : float = 2400.0
+    # ...but raising every small demand to the floor is exactly what made the old
+    # turn bang-bang. Instead, pulse: fire min_turn_duty for a FRACTION of ticks
+    # equal to demand/floor (delta-sigma), braking in between -- the same
+    # "burst + brake gap" trick as the open-loop `pulsed` turn profile. Average
+    # torque tracks the PID while each burst still breaks static friction.
+    # Set False to fall back to a plain continuous floor.
+    pulse_floor   : bool  = True
+    tolerance     : float = 0.035    # rad (~2 deg) arrival window
+    # Arrival also requires the kart to actually be SLOW, held for settle_ticks
+    # consecutive ticks. Without this a fast sweep can satisfy the window mid-
+    # spin, declare victory and coast past -- the old failure mode.
+    settle_rate   : float = 0.12     # rad/s (~7 deg/s). Loosening this is the
+                                     # fastest way to reintroduce overshoot: the
+                                     # kart coasts for whatever rate it is still
+                                     # carrying when the loop lets go.
+    settle_ticks  : int   = 2
+    max_time      : float = 8.0      # s, safety timeout per turn (was 6.0; the
+                                     # damped approach trades speed for accuracy)
 
 
 # ---------------------------------------------------------------------------

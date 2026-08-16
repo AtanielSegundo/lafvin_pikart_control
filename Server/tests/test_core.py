@@ -302,6 +302,113 @@ class TestDriveControllerClosedLoop(unittest.TestCase):
                                f"{tag} did not count forward")
 
 
+class _YawPlant:
+    """1-DOF rotational model of the kart for the gyro turn-in-place loop.
+
+    Tuned so full duty free-spins at ~6 rad/s (345 deg/s) -- at loop_hz=20 that
+    is ~17 deg swept per tick, which is exactly why an undamped turn cannot stop
+    inside a 2 deg window. Duty 0 is an active brake (extra damping), and below
+    `stiction` from rest the wheels do not break free at all.
+    """
+    def __init__(self, k=0.0015, c=1.0, inertia=1.0, brake=2.0, stiction=2000.0):
+        self.k, self.c, self.inertia = k, c, inertia
+        self.brake, self.stiction = brake, stiction
+        self.rate = 0.0          # rad/s
+        self.yaw = 0.0           # rad
+
+    def step(self, duty, dt):
+        if abs(self.rate) < 0.05 and abs(duty) < self.stiction:
+            duty = 0.0
+        torque = self.k * duty - self.c * self.rate
+        if duty == 0.0:
+            torque -= self.brake * self.rate
+        self.rate += torque * dt / self.inertia
+        self.yaw += self.rate * dt
+
+
+class _SimGyro:
+    """GyroMPU stand-in reading yaw straight off the simulated plant."""
+    def __init__(self, plant):
+        self.plant = plant
+
+    def is_connected(self):
+        return True
+
+    def get_yaw(self):
+        return math.degrees(self.plant.yaw)
+
+
+class TestGyroHeadingTurn(unittest.TestCase):
+    """turn_in_place closed on the gyro -- the PID path, not the encoder
+    fallback that TestDriveControllerClosedLoop exercises."""
+
+    def _run(self, angle_deg, max_steps=400, **plant_kw):
+        dt = 1.0 / CONFIG.control.loop_hz
+        plant = _YawPlant(**plant_kw)
+        motor = _RecordingMotor()
+        encs = {t: SimulatedEncoder(0, 0, name=t) for t in ("M1", "M2", "M3", "M4")}
+        ctrl = DriveController(motor, WheelEncoders(CONFIG.sides, encoders=encs),
+                               CONFIG, gyro=_SimGyro(plant))
+        elapsed = [0.0]
+        ctrl._clock = lambda: elapsed[0]
+        ctrl.turn_in_place(angle_deg)
+        for _ in range(max_steps):
+            ctrl.step(dt)
+            plant.step(motor.last[2], dt)     # duty3 = right side
+            elapsed[0] += dt
+            if not ctrl.heading_active():
+                break
+        # Coast out after the loop lets go: whatever rate it released with turns
+        # straight into overshoot, so the settled angle is what actually counts.
+        for _ in range(20):
+            plant.step(0.0, dt)
+        return math.degrees(plant.yaw), elapsed[0]
+
+    def test_turn_settles_without_overshooting(self):
+        for angle in (45.0, 90.0, -90.0, 180.0):
+            with self.subTest(angle=angle):
+                final, t = self._run(angle)
+                # The old bang-bang profile overshot these by 45-75 deg.
+                self.assertAlmostEqual(final, angle, delta=4.0)
+                self.assertLess(t, CONFIG.heading.max_time)
+
+    def test_turn_survives_a_stickier_plant(self):
+        # Grippier floor / weaker motors must still land, just slower.
+        final, _ = self._run(90.0, k=0.00105, brake=4.0, stiction=3000.0)
+        self.assertAlmostEqual(final, 90.0, delta=6.0)
+
+    def test_duty_scales_with_error_and_respects_the_limit(self):
+        # The defining difference from bang-bang: duty is a function of error.
+        dt = 1.0 / CONFIG.control.loop_hz
+        hg = CONFIG.heading
+        far, near = [], []
+        for err_deg, bucket in ((60.0, far), (6.0, near)):
+            plant = _YawPlant()
+            motor = _RecordingMotor()
+            encs = {t: SimulatedEncoder(0, 0, name=t) for t in ("M1", "M2", "M3", "M4")}
+            ctrl = DriveController(motor, WheelEncoders(CONFIG.sides, encoders=encs),
+                                   CONFIG, gyro=_SimGyro(plant))
+            ctrl.turn_in_place(err_deg)
+            for _ in range(12):               # sample before the plant moves far
+                ctrl.step(dt)
+                bucket.append(abs(motor.last[2]))
+                plant.step(motor.last[2], dt)
+        self.assertLessEqual(max(far), hg.output_limit + 1)
+        # Near the target the average duty is throttled (pulsed floor); far from
+        # it the loop runs at the cap.
+        self.assertGreater(sum(far) / len(far), sum(near) / len(near))
+
+    def test_no_gyro_falls_back_to_the_encoder_turn(self):
+        motor = _RecordingMotor()
+        encs = {t: SimulatedEncoder(0, 0, name=t) for t in ("M1", "M2", "M3", "M4")}
+        wheels = WheelEncoders(CONFIG.sides, encoders=encs)
+        ctrl = DriveController(motor, wheels, CONFIG,
+                               plant=SimulatedDrivePlant(wheels, CONFIG))
+        ctrl.turn_in_place(90.0)
+        self.assertFalse(ctrl.heading_active())   # position move, not heading PID
+        self.assertTrue(ctrl.move_active())
+
+
 class TestProtocol(unittest.TestCase):
     def test_parse_legacy(self):
         cmd = protocol.parse("CMD_MOTOR#1000#-500#1000#-500")
