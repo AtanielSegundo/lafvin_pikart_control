@@ -116,10 +116,10 @@ class PositionGains:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class HeadingGains:
-    kp: float = 6000.0        # duty per rad of heading error
-    ki: float = 1200.0        # gentle backstop for a residual degree or two;
+    kp: float = 4800.0        # duty per rad of heading error
+    ki: float = 1000.0        # gentle backstop for a residual degree or two;
                               # bounded by integral_limit below
-    kd: float = 2400.0        # duty per (rad/s) -- damping. THE anti-overshoot
+    kd: float = 3200.0        # duty per (rad/s) -- damping. THE anti-overshoot
                               # term: raise it if the kart still swings past,
                               # lower it if the turn crawls or judders. It is
                               # deliberately large -- it has to command REVERSE
@@ -129,27 +129,16 @@ class HeadingGains:
     integral_limit: float = 600.0
     # Deceleration ceiling, same idea as PositionGains.decel_gain: cap |duty| at
     # decel_gain*sqrt(|err|) so the approach follows w ~ sqrt(2*a*theta).
-    decel_gain    : float = 3000.0
-    # Stiction floor: four wheels scrubbing sideways need roughly this much duty
-    # before they move at all, so any PID demand below it is a stall hum.
+    decel_gain    : float = 1000.0
     min_turn_duty : float = 2400.0
-    # ...but raising every small demand to the floor is exactly what made the old
-    # turn bang-bang. Instead, pulse: fire min_turn_duty for a FRACTION of ticks
-    # equal to demand/floor (delta-sigma), braking in between -- the same
-    # "burst + brake gap" trick as the open-loop `pulsed` turn profile. Average
-    # torque tracks the PID while each burst still breaks static friction.
-    # Set False to fall back to a plain continuous floor.
     pulse_floor   : bool  = True
     tolerance     : float = 0.035    # rad (~2 deg) arrival window
-    # Arrival also requires the kart to actually be SLOW, held for settle_ticks
-    # consecutive ticks. Without this a fast sweep can satisfy the window mid-
-    # spin, declare victory and coast past -- the old failure mode.
     settle_rate   : float = 0.12     # rad/s (~7 deg/s). Loosening this is the
                                      # fastest way to reintroduce overshoot: the
                                      # kart coasts for whatever rate it is still
                                      # carrying when the loop lets go.
     settle_ticks  : int   = 2
-    max_time      : float = 8.0      # s, safety timeout per turn (was 6.0; the
+    max_time      : float = 10.0      # s, safety timeout per turn (was 6.0; the
                                      # damped approach trades speed for accuracy)
 
 
