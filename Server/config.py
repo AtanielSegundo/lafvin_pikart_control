@@ -30,7 +30,7 @@ CNT_REV_COEF = 1.0
 class WheelGeometry:
     diameter: float = 0.065            # m
     colinear_distance: float = 0.095   # m, between motors on the same axle
-    track: float = TRACK_COEF*0.155    # m, distance between left and right sides
+    track: float = TRACK_COEF*0.151    # m, distance between left and right sides
     counts_per_rev: int = CNT_REV_COEF*2340        
                     # (quadrature x4). CALIBRATE for your build.
 
