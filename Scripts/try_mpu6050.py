@@ -23,9 +23,9 @@ from mpu6050 import mpu6050
 
 MPU6050_ADDR = 0x68        # 0x69 if AD0 is tied high
 # Wired to GPIO0 (SDA) / GPIO1 (SCL) = the secondary I2C bus, /dev/i2c-0.
-MPU6050_SDA  = 0           # GPIO0 (physical pin 27) -> SDA0
-MPU6050_SCL  = 1           # GPIO1 (physical pin 28) -> SCL0
-I2C_BUS      = 0           # /dev/i2c-0  (GPIO0/1)
+MPU6050_SDA  = 2           # GPIO0 (physical pin 27) -> SDA0
+MPU6050_SCL  = 3           # GPIO1 (physical pin 28) -> SCL0
+I2C_BUS      = 1           # /dev/i2c-0  (GPIO0/1)
 SAMPLE_HZ    = 2.0         # readings per second
 
 WHO_AM_I      = 0x75

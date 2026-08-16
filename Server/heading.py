@@ -51,9 +51,9 @@ CACHE_MAX_DAY_DELTA = 1
 @dataclass(frozen=True)
 class MPU6050_CFG:
     ADDR : int = 0x68
-    SDA  : int = 0  # GPIO0 -> SDA0
-    SCL  : int = 1  # GPIO1 -> SCL0
-    I2C_BUS : int = 0  # /dev/i2c-0  (GPIO0/1)
+    SDA  : int = 2  # GPIO0 -> SDA0
+    SCL  : int = 3  # GPIO1 -> SCL0
+    I2C_BUS : int = 1  # /dev/i2c-0  (GPIO0/1)
 
 class GyroMPU:
     def __init__(self,

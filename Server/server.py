@@ -91,9 +91,6 @@ class Server:
             from heading import GyroMPU
             self.gyro = GyroMPU(sample_rate=50.0)
             if self.gyro.is_connected():
-                # Calibrate the gyro bias at boot (kart MUST be still), else the
-                # integrated yaw drifts and every heading is wrong. Re-run any
-                # time with the `calibrate_imu` command.
                 print("[gyro] calibrating bias -- keep the kart STILL...")
                 self.gyro.calibrate()
             else:
