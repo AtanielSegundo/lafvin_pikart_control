@@ -367,6 +367,7 @@ class Server:
             "mode": self.Mode,
             "drive": self.drive.telemetry(),
             "signs": dict(self.encoders.sides.signs),
+            "servo": dict(self.servo.angles),
         }
 
     def _stop_rotation(self):

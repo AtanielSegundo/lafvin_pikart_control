@@ -7,9 +7,16 @@ class Servo:
         self.PwmServo.setPWMFreq(50)
         #self.PwmServo.setServoPulse(8, 1500)
         #self.PwmServo.setServoPulse(9, 1500)
+        # channel(str) -> last angle actually commanded. There is no hardware
+        # readback on these servos, so this is the closest thing to a real
+        # position: it lets telemetry report what the camera pan/tilt is
+        # ACTUALLY at, instead of a client (e.g. the CoppeliaSim mirror) only
+        # ever guessing from whatever it last sent.
+        self.angles = {}
         # 设置舵机到中间位置（假设90度是中间位置）
         self.setServoPwm('0', 90)
         self.setServoPwm('1', 90)
+        self.setServoPwm('5', 90)
         # 添加一个小的延迟，让舵机有时间移动到位
         import time
         time.sleep(0.5)
@@ -22,7 +29,7 @@ class Servo:
             self.PwmServo.setServoPulse(8, 500 + int((angle + error) / 0.09))
         elif channel == '1':
             self.PwmServo.setServoPulse(9, 500 + int((angle + error) / 0.09))
-        
+
         #! UNABLED FOR SAFETY SEE ENCODER.PY
         # elif channel == '2':
         #     self.PwmServo.setServoPulse(10, 500 + int((angle + error) / 0.09))
@@ -32,11 +39,14 @@ class Servo:
         #     self.PwmServo.setServoPulse(12, 500 + int((angle + error) / 0.09))
         elif channel == '5':
             self.PwmServo.setServoPulse(13, 500 + int((angle + error) / 0.09))
-        
+
         elif channel == '6':
             self.PwmServo.setServoPulse(14, 500 + int((angle + error) / 0.09))
         elif channel == '7':
             self.PwmServo.setServoPulse(15, 500 + int((angle + error) / 0.09))
+        else:
+            return          # unknown/disabled channel -- nothing to record
+        self.angles[channel] = angle
 
 
 # Main program logic follows:

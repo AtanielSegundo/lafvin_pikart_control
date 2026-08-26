@@ -125,7 +125,7 @@ class HeadingGains:
                               # deliberately large -- it has to command REVERSE
                               # duty to brake, since coasting alone carries the
                               # kart tens of degrees past the target.
-    output_limit  : float = 3200.0   # max turn duty (was effectively 4095)
+    output_limit  : float = 3200.0
     integral_limit: float = 600.0
     # Deceleration ceiling, same idea as PositionGains.decel_gain: cap |duty| at
     # decel_gain*sqrt(|err|) so the approach follows w ~ sqrt(2*a*theta).
