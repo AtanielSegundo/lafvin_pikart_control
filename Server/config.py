@@ -116,7 +116,7 @@ class PositionGains:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class HeadingGains:
-    kp: float = 4100.0        # duty per rad of heading error
+    kp: float = 1000.0        # duty per rad of heading error
     ki: float = 2000.0        # gentle backstop for a residual degree or two;
                               # bounded by integral_limit below
     kd: float = 3050.0        # duty per (rad/s) -- damping. THE anti-overshoot
@@ -131,7 +131,7 @@ class HeadingGains:
     # decel_gain*sqrt(|err|) so the approach follows w ~ sqrt(2*a*theta).
     decel_gain    : float = 2200.0
     min_turn_duty : float = 2200.0
-    pulse_floor   : bool  = False
+    pulse_floor   : bool  = True
     tolerance     : float = 0.008726646259971648 # 0.5 deg
     settle_rate   : float = 0.12     # rad/s (~7 deg/s). Loosening this is the
                                      # fastest way to reintroduce overshoot: the
