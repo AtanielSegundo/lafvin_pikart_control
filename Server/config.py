@@ -116,10 +116,10 @@ class PositionGains:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class HeadingGains:
-    kp: float = 4800.0        # duty per rad of heading error
-    ki: float = 1000.0        # gentle backstop for a residual degree or two;
+    kp: float = 4100.0        # duty per rad of heading error
+    ki: float = 2000.0        # gentle backstop for a residual degree or two;
                               # bounded by integral_limit below
-    kd: float = 3200.0        # duty per (rad/s) -- damping. THE anti-overshoot
+    kd: float = 3050.0        # duty per (rad/s) -- damping. THE anti-overshoot
                               # term: raise it if the kart still swings past,
                               # lower it if the turn crawls or judders. It is
                               # deliberately large -- it has to command REVERSE
@@ -129,16 +129,16 @@ class HeadingGains:
     integral_limit: float = 600.0
     # Deceleration ceiling, same idea as PositionGains.decel_gain: cap |duty| at
     # decel_gain*sqrt(|err|) so the approach follows w ~ sqrt(2*a*theta).
-    decel_gain    : float = 1000.0
-    min_turn_duty : float = 2400.0
+    decel_gain    : float = 1800.0
+    min_turn_duty : float = 2200.0
     pulse_floor   : bool  = True
-    tolerance     : float = 0.035    # rad (~2 deg) arrival window
+    tolerance     : float = 0.008726646259971648 # 0.5 deg
     settle_rate   : float = 0.12     # rad/s (~7 deg/s). Loosening this is the
                                      # fastest way to reintroduce overshoot: the
                                      # kart coasts for whatever rate it is still
                                      # carrying when the loop lets go.
     settle_ticks  : int   = 2
-    max_time      : float = 10.0      # s, safety timeout per turn (was 6.0; the
+    max_time      : float = 20.0     # s, safety timeout per turn (was 6.0; the
                                      # damped approach trades speed for accuracy)
 
 

@@ -15,8 +15,8 @@ class Servo:
         self.angles = {}
         # 设置舵机到中间位置（假设90度是中间位置）
         self.setServoPwm('0', 90)
-        self.setServoPwm('1', 90)
-        self.setServoPwm('5', 90)
+        self.setServoPwm('1', 37)   # tilt -- measured camera-centered value
+        self.setServoPwm('5', 50)   # pan  -- measured camera-centered value
         # 添加一个小的延迟，让舵机有时间移动到位
         import time
         time.sleep(0.5)
