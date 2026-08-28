@@ -116,17 +116,17 @@ class PositionGains:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class HeadingGains:
-    kp: float = 4100.0        # duty per rad of heading error
+    kp: float = 4200.0        # duty per rad of heading error
     ki: float = 2000.0        # gentle backstop for a residual degree or two;
                               # bounded by integral_limit below
-    kd: float = 3050.0        # duty per (rad/s) -- damping. THE anti-overshoot
+    kd: float = 3200.0        # duty per (rad/s) -- damping. THE anti-overshoot
                               # term: raise it if the kart still swings past,
                               # lower it if the turn crawls or judders. It is
                               # deliberately large -- it has to command REVERSE
                               # duty to brake, since coasting alone carries the
                               # kart tens of degrees past the target.
     output_limit  : float = 3200.0
-    integral_limit: float = 800.0
+    integral_limit: float = 600.0
     # Deceleration ceiling, same idea as PositionGains.decel_gain: cap |duty| at
     # decel_gain*sqrt(|err|) so the approach follows w ~ sqrt(2*a*theta).
     decel_gain    : float = 1100.0
