@@ -9,6 +9,8 @@ Does not require the rest of this codebase - only smbus/smbus2.
 """
 
 import sys
+import os
+import glob
 import time
 import errno
 import subprocess
@@ -21,6 +23,83 @@ except ImportError:
 
 def hexaddr(a):
     return "0x{:02X}".format(a)
+
+
+def check_bus_exists(bus_num):
+    print("== bus device check ==")
+    dev = "/dev/i2c-{}".format(bus_num)
+    all_devs = sorted(glob.glob("/dev/i2c-*"))
+    print("Present I2C device nodes: {}".format(", ".join(all_devs) or "none"))
+    if os.path.exists(dev):
+        print("PASS: {} exists".format(dev))
+    else:
+        print("FAIL: {} does not exist.".format(dev))
+        print(
+            "  -> The kernel never bound an I2C adapter to bus {}. This means the\n"
+            "     overlay isn't loaded, not that the PCA9685 is bad. Check:\n"
+            "       - grep i2c /boot/firmware/config.txt (or /boot/config.txt)\n"
+            "         needs: dtparam=i2c_arm=on\n"
+            "       - sudo i2cdetect -l   (lists adapters actually bound)\n"
+            "       - reboot after fixing config.txt"
+        )
+    print()
+
+
+def check_i2cdetect_l():
+    print("== i2cdetect -l (bound adapters) ==")
+    try:
+        out = subprocess.run(["i2cdetect", "-l"], capture_output=True, text=True, timeout=10)
+        text = (out.stdout or out.stderr).strip()
+        print(text or "(no output)")
+    except FileNotFoundError:
+        print("i2cdetect not found. Install with: sudo apt install i2c-tools")
+    except Exception as e:
+        print("i2cdetect -l failed: {}".format(e))
+    print()
+
+
+def check_config_txt():
+    print("== config.txt i2c settings ==")
+    candidates = ["/boot/firmware/config.txt", "/boot/config.txt"]
+    path = next((p for p in candidates if os.path.exists(p)), None)
+    if not path:
+        print("Could not find config.txt at any of: {}".format(", ".join(candidates)))
+        print()
+        return
+    try:
+        with open(path) as f:
+            lines = [l.rstrip() for l in f if "i2c" in l.lower()]
+        print("From {}:".format(path))
+        if lines:
+            for l in lines:
+                print("  {}".format(l))
+        else:
+            print("  (no i2c-related lines found)")
+        if not any("dtparam=i2c_arm=on" in l.replace(" ", "") for l in lines):
+            print(
+                "  NOTE: 'dtparam=i2c_arm=on' not found (or is commented out) -\n"
+                "  hardware I2C1 (GPIO2/3) may not be enabled at all."
+            )
+    except Exception as e:
+        print("Could not read {}: {}".format(path, e))
+    print()
+
+
+def check_dmesg():
+    print("== recent dmesg i2c/i2c-bcm2835 lines ==")
+    try:
+        out = subprocess.run(["dmesg"], capture_output=True, text=True, timeout=10)
+        lines = [l for l in out.stdout.splitlines() if "i2c" in l.lower()]
+        if lines:
+            for l in lines[-20:]:
+                print("  {}".format(l))
+        else:
+            print("  (no i2c-related dmesg lines - may need sudo, or buffer was cleared)")
+    except FileNotFoundError:
+        print("dmesg not found.")
+    except Exception as e:
+        print("dmesg failed (try running this script with sudo): {}".format(e))
+    print()
 
 
 def run_i2cdetect(bus_num):
@@ -132,6 +211,10 @@ def main():
 
     print("I2C diagnostic - bus={} target={}\n".format(bus_num, hexaddr(address)))
 
+    check_bus_exists(bus_num)
+    check_i2cdetect_l()
+    check_config_txt()
+    check_dmesg()
     run_i2cdetect(bus_num)
     found = software_scan(bus_num)
     test_target(bus_num, address)
