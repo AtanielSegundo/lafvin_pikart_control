@@ -191,6 +191,7 @@ class DriveController:
         
         self.dist_arr = deque(maxlen=3)     # recent VALID readings (min = closest)
         self.front_distance_cm = None       # latest valid front distance, for UI
+        self._front_distance_ts = 0.0       # when that reading landed (expiry)
         self._dist_thread: Optional[threading.Thread] = None
         self._dist_stop_evt = threading.Event()
         self.dist_guard_lock = threading.Lock()
@@ -776,6 +777,23 @@ class DriveController:
             if raw is not None and raw > 0 and raw != 255:
                 self.dist_arr.append(raw)
                 self.front_distance_cm = raw          # latest valid, for the UI
+                self._front_distance_ts = now
+            elif (self.front_distance_cm is not None and
+                  (now - self._front_distance_ts) >
+                      self.config.control.front_distance_ttl_s):
+                # Nothing valid for a while -> stop REPORTING a reading that is
+                # no longer true. Without this the last good value sticks
+                # forever: the RPi.GPIO sensor answers "out of range" with its
+                # 255 sentinel, which is dropped just above, so a clear road
+                # never refreshes the field and clients keep seeing the last
+                # close reading. (The pigpio reader doesn't have the problem --
+                # it reports max range for far/clear -- but the fallback does.)
+                # None is already the "unknown" value here and downstream: the
+                # web UI renders it as "-- cm".
+                # NOTE: only the reported value expires. dist_arr and the
+                # collision guard are deliberately left alone -- see the note
+                # to the operator; changing guard behaviour is a separate call.
+                self.front_distance_cm = None
 
             if self.dist_arr:
                 f = min(self.dist_arr)

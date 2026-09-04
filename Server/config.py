@@ -226,6 +226,8 @@ class ControlConfig:
     telemetry_hz: float = 500.0       # rate telemetry is pushed to clients
     command_timeout: float = 0.1      # s; stop motors if no drive cmd arrives
     minimum_front_distance_cm: int = 10   # front guard trips below this (cm)
+    front_distance_ttl_s: float = 0.5     # drop the REPORTED distance after
+                                          # this long with no valid reading
     max_linear: float = 0.6           # m/s, saturates drive commands
     max_angular: float = 4.0          # rad/s
 
