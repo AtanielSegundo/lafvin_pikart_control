@@ -3,15 +3,14 @@ import time
 import csv
 import sys
 
-__HERE   = os.path.dirname(__file__)
+__HERE   = os.path.dirname(os.path.abspath(__file__))
 __PARENT = os.path.dirname(__HERE)
 __SERVER = os.path.join(__PARENT,"Server")
 
+if __SERVER not in sys.path:
+    sys.path.insert(0, __SERVER)
 
-print("[PATH ADDED]".join([__HERE,__PARENT,__SERVER]))
-
-sys.path.append(__PARENT)
-sys.path.append(__SERVER)
+print(f"[PATH ADDED] {__SERVER}")
 
 from odometry   import SkidSteerOdometry
 from config     import CONFIG
