@@ -1,4 +1,5 @@
 import os
+import time
 import csv
 import sys
 
@@ -32,5 +33,7 @@ if __name__ == "__main__":
     encoders = WheelEncoders(CONFIG.sides)
     
     DUTY_TEST = 2048 
-    
     set_foward_motors_duty(motor,DUTY_TEST)
+    
+    time.sleep(1)
+    set_foward_motors_duty(motor,0)
