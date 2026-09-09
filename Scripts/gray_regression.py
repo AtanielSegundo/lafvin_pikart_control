@@ -329,7 +329,9 @@ def _sample_run(rig, writer, run_id, duty_fn, max_time,
         duty = duty_fn(st)
         if duty is None:
             break
-        set_foward_motors_duty(rig.motor, duty)
+        apply_fn(rig.motor, duty)          # NOT set_foward_motors_duty: the
+                                           # heading run drives the same loop
+                                           # through set_turn_motors_duty
         st.duty = duty_prev = duty
         phase_prev = st.phase
 
