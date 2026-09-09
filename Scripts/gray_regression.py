@@ -82,13 +82,21 @@ WALL_STOP_CM  = 20
 MOVE_EPS_MPS  = 0.03          # |v| below this counts as "not moving"
 VEL_WIN_S     = 0.10          # moving-average window for stall decisions
 
-# w_gyro is obtained by differencing the gyro's INTEGRATED yaw, so the gyro must
-# run well above FS or the difference is a staircase: at 40 Hz (the server's
-# loop_hz*2) some 50 Hz ticks would see two updates and others none, and that
-# quantisation lands straight on the heading output. 4x oversampling. GyroMPU
-# degrades gracefully if the I2C bus cannot keep up -- _update_loop just runs at
-# whatever rate it achieves rather than falling apart.
-GYRO_HZ       = 200.0
+# EVERYTHING is on I2C bus 1: PCA9685 (0x40), the ADC, and the MPU6050 --
+# MPU6050_CFG.I2C_BUS is 1 despite the "/dev/i2c-0" comment next to it. So gyro
+# rate is not free: it competes with the motor writes for the same bus, and one
+# setMotorModel costs 8 setPWM * 4 byte-writes = 32 I2C transactions.
+#
+# Running the gyro at 200 Hz saturated the bus: the loop overran its period
+# (dt wandered from 0.02 to 0.16 s), MPU reads failed, GyroMPU dropped
+# `connected`, and each _reconnect backed off 300 ms -- 15 blank ticks of
+# w_gyro every time. 100 Hz, with the traffic cuts below, leaves headroom.
+# Lower it to 50 (what server.py uses and proves works) if gaps persist.
+GYRO_HZ       = 100.0
+
+# Battery sag is a slow signal; reading the ADC every tick just adds I2C traffic
+# to the bus the gyro needs. Sampled at this period and held between reads.
+VBAT_PERIOD_S = 0.5
 
 DATA_DIR = os.path.join(__HERE, "data")
 
@@ -187,16 +195,30 @@ class Rig:
         self.odom     = SkidSteerOdometry(CONFIG.wheel)
         self.mpc      = CONFIG.wheel.meters_per_count
         self._prev_yaw = None
+        self._prev_yaw_t = 0.0
+        self._vbat = ""
+        self._vbat_t = -1e9
+        self.gyro_gaps = 0             # ticks with no usable gyro sample
+        self.gyro_stale = 0            # ticks where the gyro had not updated
 
     def vbat(self):
-        """Battery volts. Logged per sample because pack sag is the largest
-        systematic error across a session; with it you can fit the proper
-        gray-box form v = K*(u*V/V_nom - u0) instead of watching K drift for
-        no visible reason."""
+        """Battery volts, sampled at VBAT_PERIOD_S and held in between.
+
+        Logged because pack sag is the largest systematic error across a
+        session; with it you can fit the proper gray-box form
+        v = K*(u*V/V_nom - u0) instead of watching K drift for no visible
+        reason. It does NOT need 50 Hz -- and at 50 Hz the extra I2C read per
+        tick was starving the gyro on the same bus.
+        """
+        now = time.monotonic()
+        if now - self._vbat_t < VBAT_PERIOD_S:
+            return self._vbat
+        self._vbat_t = now
         try:
-            return round(self.motor.adc.recvADC(2) * 3, 3)
+            self._vbat = round(self.motor.adc.recvADC(2) * 3, 3)
         except Exception:                                   # noqa: BLE001
-            return ""
+            self._vbat = ""
+        return self._vbat
 
     def distance_cm(self):
         try:
@@ -204,20 +226,42 @@ class Rig:
         except Exception:                                   # noqa: BLE001
             return None
 
-    def yaw_dtheta(self):
-        """(yaw_rad, dtheta_rad since the last call), or (None, None).
+    def yaw_sample(self):
+        """(yaw_rad, dtheta_rad, w_rad_s) -- the last two None when the gyro has
+        produced no NEW sample since the previous tick.
 
-        No wrap handling: GyroMPU integrates angles["z"] free-running ("yaw:
-        pure bias-corrected gyro"), so it never jumps at +/-pi and a plain
-        difference is correct even after several full turns.
+        w is differenced over the interval between two DISTINCT yaw readings,
+        not over the control tick. GyroMPU integrates on its own thread, so a
+        tick can read back the same yaw twice; dividing an unchanged yaw by the
+        tick dt reports w = 0, a measurement the kart never made, and those
+        false zeros drag the fitted K_w down. Skipping those ticks and dividing
+        by the true elapsed time on the ones that did update keeps every logged
+        w honest -- and removes the reason the gyro had to outrun the loop.
+
+        A dropout resets the reference rather than differencing across it:
+        while GyroMPU is disconnected _update_loop stops integrating, so yaw
+        FREEZES. Differencing across an outage would report far less rotation
+        than actually happened.
+
+        No wrap handling: angles["z"] is free-running ("yaw: pure bias-corrected
+        gyro"), so it never jumps at +/-pi even after several full turns.
         """
+        now = time.monotonic()
         yaw = read_gyro_yaw(self.gyro)
         if yaw is None:
-            self._prev_yaw = None      # reset so a reconnect doesn't jump
-            return None, None
-        d = None if self._prev_yaw is None else yaw - self._prev_yaw
-        self._prev_yaw = yaw
-        return yaw, d
+            self._prev_yaw = None
+            self.gyro_gaps += 1
+            return None, None, None
+        if self._prev_yaw is None:
+            self._prev_yaw, self._prev_yaw_t = yaw, now
+            return yaw, None, None
+        if yaw == self._prev_yaw:              # thread has not ticked yet
+            self.gyro_stale += 1
+            return yaw, None, None
+        dtheta = yaw - self._prev_yaw
+        span = now - self._prev_yaw_t
+        self._prev_yaw, self._prev_yaw_t = yaw, now
+        return yaw, dtheta, (dtheta / span if span > 0.0 else None)
 
     def teardown(self):
         set_foward_motors_duty(self.motor, 0)      # motors FIRST, always
@@ -269,6 +313,9 @@ def _sample_run(rig, writer, run_id, duty_fn, max_time,
     """
     st  = RunState()
     win = deque(maxlen=max(1, int(VEL_WIN_S * FS)))
+    rig.gyro_gaps = rig.gyro_stale = 0
+    ticks = 0
+    dt_max = 0.0
 
     duty = duty_fn(st)
     if duty is None:
@@ -288,6 +335,8 @@ def _sample_run(rig, writer, run_id, duty_fn, max_time,
         if dt <= 0.0:
             dt = TS
         st.t, st.dt = now - t0, dt
+        ticks += 1
+        dt_max = max(dt_max, dt)
 
         # -- 1. read: these counts accrued under duty_prev ------------------
         dc_l, dc_r = rig.encoders.read_reset_sides()
@@ -295,7 +344,7 @@ def _sample_run(rig, writer, run_id, duty_fn, max_time,
         d_right  = dc_r * rig.mpc
         d_center = (d_left + d_right) / 2.0
 
-        yaw, gyro_dtheta = rig.yaw_dtheta()
+        yaw, gyro_dtheta, w_gyro = rig.yaw_sample()
         # For the translational runs theta is a diagnostic only -- it decides
         # whether to KEEP the run. For the heading run w_gyro IS the output.
         rig.odom.update_from_distances(d_left, d_right, dt, d_theta=gyro_dtheta)
@@ -304,7 +353,7 @@ def _sample_run(rig, writer, run_id, duty_fn, max_time,
         st.v_center  = d_center / dt
         win.append(st.v_center)
         st.v_avg   = sum(win) / len(win)
-        st.w_gyro   = (gyro_dtheta / dt) if gyro_dtheta is not None else None
+        st.w_gyro   = w_gyro
 
         # -- 2. log: the row describes the interval that just ENDED ---------
         writer.writerow([f"{st.t:.4f}", f"{dt:.5f}", run_id, phase_prev,
@@ -329,9 +378,13 @@ def _sample_run(rig, writer, run_id, duty_fn, max_time,
         duty = duty_fn(st)
         if duty is None:
             break
-        apply_fn(rig.motor, duty)          # NOT set_foward_motors_duty: the
-                                           # heading run drives the same loop
-                                           # through set_turn_motors_duty
+        if duty != duty_prev:
+            # NOT set_foward_motors_duty: the heading run drives this same loop
+            # through set_turn_motors_duty. And only on a CHANGE -- one
+            # setMotorModel is 32 I2C byte writes, so rewriting an unchanged
+            # duty at 50 Hz burned 1600 transactions/s on the bus the gyro and
+            # the ADC share, for a duty that only moves every T_switch.
+            apply_fn(rig.motor, duty)
         st.duty = duty_prev = duty
         phase_prev = st.phase
 
@@ -339,6 +392,15 @@ def _sample_run(rig, writer, run_id, duty_fn, max_time,
         if sleep > 0.0:
             stop_evt.wait(sleep)
 
+    if ticks:
+        # Loop health. dt_max far above TS, or many gyro gaps, means the I2C bus
+        # is saturated and the run is not trustworthy -- see the GYRO_HZ note.
+        print(f"  [loop] {ticks} ticks  dt_max {dt_max * 1000:.0f} ms "
+              f"(TS {TS * 1000:.0f})  gyro: {rig.gyro_gaps} lacunas, "
+              f"{rig.gyro_stale} repetidos")
+        if dt_max > 2.0 * TS or rig.gyro_gaps > ticks // 10:
+            print("  [loop] AVISO: laco estourando o periodo ou gyro caindo -- "
+                  "baixe GYRO_HZ (ou FS) antes de confiar nestes dados")
     return st
 
 
