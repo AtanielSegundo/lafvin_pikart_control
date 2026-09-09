@@ -163,7 +163,7 @@ def dist_ok(cm):
     are large, so an unfiltered sentinel fails in the "keep driving" direction
     -- exactly the direction that matters for a safety stop.
     """
-    return cm is not None and 0 < cm < 300 and cm != 255
+    return cm is not None and 0 < cm <= 300 and cm != 255
 
 
 def test_motors(rig, duty=2000, seconds=1.0):
@@ -724,3 +724,6 @@ if __name__ == "__main__":
         fh.close()
         print(f"\n[resumo] estatico={u_static}  cinetico={u_kin}")
         print(f"[csv] {path}")
+
+# THRESHOLD ESTATICO = 800
+# 
