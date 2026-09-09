@@ -13,11 +13,11 @@ print("[PATH ADDED]".join([__HERE,__PARENT,__SERVER]))
 sys.path.append(__PARENT)
 sys.path.append(__SERVER)
 
-from Server.odometry   import SkidSteerOdometry
-from Server.config     import CONFIG
-from Server.encoders   import WheelEncoders
-from Server.Motor      import Motor
-from Server.Ultrasonic import Ultrasonic
+from odometry   import SkidSteerOdometry
+from config     import CONFIG
+from encoders   import WheelEncoders
+from Motor      import Motor
+from Ultrasonic import Ultrasonic
 
 def set_foward_motors_duty(m:Motor,duty_pwm:int):
     m.setMotorModel(duty_pwm,duty_pwm,duty_pwm,duty_pwm)
@@ -25,7 +25,7 @@ def set_foward_motors_duty(m:Motor,duty_pwm:int):
 if __name__ == "__main__":
     
     try:
-        from Server.ultrasonic_pigpio import UltrasonicPigpio
+        from ultrasonic_pigpio import UltrasonicPigpio
         ultrasonic = UltrasonicPigpio()
         print("[ultrasonic] using pigpio (hardware-timed echo)")
     except Exception as e:
