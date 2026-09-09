@@ -7,6 +7,9 @@ __HERE   = os.path.dirname(__file__)
 __PARENT = os.path.dirname(__HERE)
 __SERVER = os.path.join(__PARENT,"Server")
 
+
+print("[PATH ADDED]".join([__HERE,__PARENT,__SERVER]))
+
 sys.path.append(__PARENT)
 sys.path.append(__SERVER)
 
