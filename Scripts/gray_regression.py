@@ -98,6 +98,19 @@ GYRO_HZ       = 100.0
 # to the bus the gyro needs. Sampled at this period and held between reads.
 VBAT_PERIOD_S = 0.5
 
+# MPU6050 gyro full scale, deg/s. heading.py defaults to GYRO_RANGE_250DEG, i.e.
+# +-4.36 rad/s -- which an in-place spin blows straight past: the encoders put
+# this kart at 6-15 rad/s (340-860 deg/s) at PRBS_heading duties. Beyond full
+# scale the 16-bit reading saturates and wraps, so w_gyro comes back erratic and
+# 2-3x BELOW the encoder rate, with occasional values above the range itself.
+# +-1000 deg/s = 17.5 rad/s leaves headroom; the resolution it costs (5.3e-4
+# rad/s per LSB) is nothing against this signal.
+#
+# The server has the same exposure: at HeadingGains duties (min_turn_duty 2200,
+# output_limit 3200) a turn_in_place spins fast enough to clip, so the heading
+# PID closes on corrupted feedback.
+GYRO_FS_DEG   = 1000
+
 DATA_DIR = os.path.join(__HERE, "data")
 
 CSV_HEADER = ["t", "dt", "run_id", "phase", "duty",
@@ -134,10 +147,18 @@ def get_ultrasonic_handler():
         return Ultrasonic()
 
 
-def get_gyro_handler(sample_rate=GYRO_HZ):
+def get_gyro_handler(sample_rate=GYRO_HZ, fs_deg=GYRO_FS_DEG):
     try:
         from heading import GyroMPU
-        gyro = GyroMPU(sample_rate=sample_rate)    # __init__ already start()s it
+        from mpu6050 import mpu6050 as _mpu
+        rng = {250:  _mpu.GYRO_RANGE_250DEG,  500:  _mpu.GYRO_RANGE_500DEG,
+               1000: _mpu.GYRO_RANGE_1000DEG, 2000: _mpu.GYRO_RANGE_2000DEG}[fs_deg]
+        # set_configs applies the range in __init__, before calibrate() below,
+        # so the bias is measured on the range that will actually be used.
+        gyro = GyroMPU(sample_rate=sample_rate,    # __init__ already start()s it
+                       gyro_range=rng)
+        print(f"[gyro] fundo de escala +-{fs_deg} deg/s "
+              f"(+-{math.radians(fs_deg):.1f} rad/s)")
         if gyro.is_connected():
             print("[gyro] calibrating bias -- keep the kart STILL...")
             gyro.calibrate()
@@ -316,6 +337,7 @@ def _sample_run(rig, writer, run_id, duty_fn, max_time,
     rig.gyro_gaps = rig.gyro_stale = 0
     ticks = 0
     dt_max = 0.0
+    w_peak = 0.0
 
     duty = duty_fn(st)
     if duty is None:
@@ -354,6 +376,8 @@ def _sample_run(rig, writer, run_id, duty_fn, max_time,
         win.append(st.v_center)
         st.v_avg   = sum(win) / len(win)
         st.w_gyro   = w_gyro
+        if w_gyro is not None:
+            w_peak = max(w_peak, abs(w_gyro))
 
         # -- 2. log: the row describes the interval that just ENDED ---------
         writer.writerow([f"{st.t:.4f}", f"{dt:.5f}", run_id, phase_prev,
@@ -395,12 +419,22 @@ def _sample_run(rig, writer, run_id, duty_fn, max_time,
     if ticks:
         # Loop health. dt_max far above TS, or many gyro gaps, means the I2C bus
         # is saturated and the run is not trustworthy -- see the GYRO_HZ note.
+        fs = math.radians(GYRO_FS_DEG)
         print(f"  [loop] {ticks} ticks  dt_max {dt_max * 1000:.0f} ms "
               f"(TS {TS * 1000:.0f})  gyro: {rig.gyro_gaps} lacunas, "
-              f"{rig.gyro_stale} repetidos")
+              f"{rig.gyro_stale} repetidos, |w|max {w_peak:.2f} rad/s "
+              f"({100 * w_peak / fs:.0f}% do fundo de escala)")
         if dt_max > 2.0 * TS or rig.gyro_gaps > ticks // 10:
             print("  [loop] AVISO: laco estourando o periodo ou gyro caindo -- "
                   "baixe GYRO_HZ (ou FS) antes de confiar nestes dados")
+        if w_peak > 0.8 * fs:
+            # Past full scale the reading saturates and wraps, and nothing else
+            # flags it: w just comes back low and erratic, and the fit reads
+            # that as a small, noisy K_w.
+            print(f"  [loop] AVISO: w chegou a {100 * w_peak / fs:.0f}% do fundo "
+                  f"de escala do gyro -- suba GYRO_FS_DEG (hoje {GYRO_FS_DEG}) "
+                  f"ou baixe o duty; acima da faixa a leitura satura e os dados "
+                  f"de heading nao valem")
     return st
 
 
