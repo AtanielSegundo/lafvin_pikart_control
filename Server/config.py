@@ -222,7 +222,7 @@ MOTOR_CHANNELS = {
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class ControlConfig:
-    loop_hz: float = 20.0             # closed-loop update rate
+    loop_hz: float = 50.0             # closed-loop update rate
     telemetry_hz: float = 500.0       # rate telemetry is pushed to clients
     command_timeout: float = 0.1      # s; stop motors if no drive cmd arrives
     minimum_front_distance_cm: int = 10   # front guard trips below this (cm)

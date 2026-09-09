@@ -1,12 +1,60 @@
-import os
-import time
+"""
+Gray-box identification rig for the PiKart drivetrain.
+
+Collects the (u, v) data needed to fit
+
+    tau * v_dot + v = K * (u - u0)          per side, u = PWM duty
+
+over three experiments, each writing one CSV row per sample tick:
+
+  static        -- lowest duty that breaks the kart away FROM REST -> u0_static
+  kinetic       -- lowest duty that SUSTAINS motion once rolling   -> u0_kinetic
+  prbs          -- pseudo-random excitation, driving forward       -> K, tau
+  prbs_heading  -- the same, spinning in place, output = yaw rate  -> K_w, tau
+
+  tau * w_dot + w = K_w * (u - u0_turn)      (the heading plant)
+
+Y is v_center = (d_left + d_right) / (2*dt), NOT odom.pose.x: pose.x is the
+WORLD-frame coordinate (x = integral of d_center*cos(theta)), so any heading
+drift -- and a skid-steer always drifts -- shrinks it by cos(theta) for reasons
+that have nothing to do with the motor. pose.theta is logged as a DISCARD
+criterion instead: a run that curved is contaminated, not fittable.
+
+The ultrasonic is a SAFETY INTERLOCK ONLY: it aborts a run at WALL_STOP_CM and
+never enters the CSV.
+
+Alongside v_center the raw count deltas go in too, because meters_per_count
+depends on counts_per_rev = 2340, itself a value being calibrated -- keeping the
+counts lets a corrected constant be applied offline without re-running.
+
+STOP THE SERVER SERVICE FIRST. read_reset_sides() consumes the counters, so the
+DriveController loop and this script would steal each other's counts, and both
+processes would drive PCA9685 0x40 over the same I2C bus.
+
+    sudo systemctl stop <servico>
+    sudo pigpiod                       # required by encoders + ultrasonic
+    sudo python3 Scripts/gray_regression.py static
+"""
+import argparse
 import csv
+import math
+import os
+import signal
 import sys
+import threading
+import time
+
+from collections import deque
+from datetime import datetime
 
 __HERE   = os.path.dirname(os.path.abspath(__file__))
 __PARENT = os.path.dirname(__HERE)
 __SERVER = os.path.join(__PARENT,"Server")
 
+# Server/ is not a package -- its modules import each other flat ("from config
+# import ...", "from PCA9685 import ..."), so Server/ itself goes on the path and
+# the imports below stay unprefixed. Importing them as "Server.x" instead loads
+# every shared module twice, under two names, with two CONFIG singletons.
 if __SERVER not in sys.path:
     sys.path.insert(0, __SERVER)
 
@@ -18,24 +66,661 @@ from encoders   import WheelEncoders
 from Motor      import Motor
 from Ultrasonic import Ultrasonic
 
+# ---------------------------------------------------------------------------
+# Experiment constants
+# ---------------------------------------------------------------------------
+# 50 Hz, not CONFIG.control.loop_hz (20): with tau ~ 0.2 s, 20 Hz gives only 4
+# samples per time constant -- too few to identify tau. The trade is velocity
+# quantisation (mpc/Ts: 1.7 mm/s at 20 Hz vs 4.4 mm/s at 50 Hz), but you can
+# always filter offline and never resample upwards.
+FS            = 50.0
+TS            = 1.0 / FS
+
+# The ultrasonic is a SAFETY INTERLOCK ONLY -- it aborts a run when the wall gets
+# this close and never appears in the data. Y is v_center.
+WALL_STOP_CM  = 20
+MOVE_EPS_MPS  = 0.03          # |v| below this counts as "not moving"
+VEL_WIN_S     = 0.10          # moving-average window for stall decisions
+
+# w_gyro is obtained by differencing the gyro's INTEGRATED yaw, so the gyro must
+# run well above FS or the difference is a staircase: at 40 Hz (the server's
+# loop_hz*2) some 50 Hz ticks would see two updates and others none, and that
+# quantisation lands straight on the heading output. 4x oversampling. GyroMPU
+# degrades gracefully if the I2C bus cannot keep up -- _update_loop just runs at
+# whatever rate it achieves rather than falling apart.
+GYRO_HZ       = 200.0
+
+DATA_DIR = os.path.join(__HERE, "data")
+
+CSV_HEADER = ["t", "dt", "run_id", "phase", "duty",
+              "v_center", "v_left", "v_right",
+              "w_gyro", "yaw",
+              "dc_left", "dc_right", "vbat", "theta"]
+
+stop_evt = threading.Event()
+PAUSE_BETWEEN_RUNS = True
+
+
+# ---------------------------------------------------------------------------
+# Hardware helpers
+# ---------------------------------------------------------------------------
 def set_foward_motors_duty(m:Motor,duty_pwm:int):
     m.setMotorModel(duty_pwm,duty_pwm,duty_pwm,duty_pwm)
 
-if __name__ == "__main__":
-    
+
+def set_turn_motors_duty(m:Motor, duty_pwm:int):
+    """In-place spin. POSITIVE duty = CCW (left side back, right side forward),
+    matching DriveController._set_raw_turn and _heading_duty's (-duty, +duty)
+    and the +ccw convention used throughout the server."""
+    d = int(duty_pwm)
+    m.setMotorModel(-d, -d, d, d)
+
+
+def get_ultrasonic_handler():
     try:
         from ultrasonic_pigpio import UltrasonicPigpio
-        ultrasonic = UltrasonicPigpio()
         print("[ultrasonic] using pigpio (hardware-timed echo)")
+        return UltrasonicPigpio()
     except Exception as e:
         print(f"[ultrasonic] pigpio unavailable ({e}); RPi.GPIO fallback")
-        ultrasonic = Ultrasonic()
-        
-    motor = Motor()
-    encoders = WheelEncoders(CONFIG.sides)
-    
-    DUTY_TEST = 2048 
-    set_foward_motors_duty(motor,DUTY_TEST)
-    
-    time.sleep(1)
-    set_foward_motors_duty(motor,0)
+        return Ultrasonic()
+
+
+def get_gyro_handler(sample_rate=GYRO_HZ):
+    try:
+        from heading import GyroMPU
+        gyro = GyroMPU(sample_rate=sample_rate)    # __init__ already start()s it
+        if gyro.is_connected():
+            print("[gyro] calibrating bias -- keep the kart STILL...")
+            gyro.calibrate()
+        else:
+            print("[gyro] MPU6050 not detected; heading falls back to encoders")
+        return gyro
+    except Exception as e:                      # noqa: BLE001
+        print(f"[gyro] unavailable ({e}); heading falls back to encoders")
+        return None
+
+
+def read_gyro_yaw(gyro):
+    """Latest gyro yaw in radians (mounting sign/axis applied by GyroMPU),
+    or None if no gyro / disconnected."""
+    if gyro is None or not gyro.is_connected():
+        return None
+    try:
+        if hasattr(gyro, "get_yaw"):
+            return math.radians(gyro.get_yaw())
+        return math.radians(gyro.get_angles_gyro()["z"])
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
+def dist_ok(cm):
+    """Is this ultrasonic reading a MEASUREMENT rather than a sentinel?
+
+    Used only to decide whether the wall interlock may trust a reading.
+    UltrasonicPigpio returns max_distance_cm (300) for far/clear, stale AND
+    faulted alike; the RPi.GPIO Ultrasonic returns 255 for a failed read. Both
+    are large, so an unfiltered sentinel fails in the "keep driving" direction
+    -- exactly the direction that matters for a safety stop.
+    """
+    return cm is not None and 0 < cm < 300 and cm != 255
+
+
+def test_motors(rig, duty=2000, seconds=1.0):
+    """Wiring smoke test. duty defaults ABOVE min_move_duty (1200 in config) --
+    a lower default would simply fail to break away and look like dead motors."""
+    set_foward_motors_duty(rig.motor, duty)
+    stop_evt.wait(seconds)
+    set_foward_motors_duty(rig.motor, 0)
+
+
+class Rig:
+    """Everything the experiments touch, built once."""
+
+    def __init__(self):
+        self.motor    = Motor()
+        self.ultra    = get_ultrasonic_handler()
+        self.gyro     = get_gyro_handler()
+        self.encoders = WheelEncoders(CONFIG.sides)
+        self.encoders.begin()          # registers the pigpio edge callbacks --
+                                       # without it every count stays 0 forever
+        self.odom     = SkidSteerOdometry(CONFIG.wheel)
+        self.mpc      = CONFIG.wheel.meters_per_count
+        self._prev_yaw = None
+
+    def vbat(self):
+        """Battery volts. Logged per sample because pack sag is the largest
+        systematic error across a session; with it you can fit the proper
+        gray-box form v = K*(u*V/V_nom - u0) instead of watching K drift for
+        no visible reason."""
+        try:
+            return round(self.motor.adc.recvADC(2) * 3, 3)
+        except Exception:                                   # noqa: BLE001
+            return ""
+
+    def distance_cm(self):
+        try:
+            return self.ultra.get_distance()
+        except Exception:                                   # noqa: BLE001
+            return None
+
+    def yaw_dtheta(self):
+        """(yaw_rad, dtheta_rad since the last call), or (None, None).
+
+        No wrap handling: GyroMPU integrates angles["z"] free-running ("yaw:
+        pure bias-corrected gyro"), so it never jumps at +/-pi and a plain
+        difference is correct even after several full turns.
+        """
+        yaw = read_gyro_yaw(self.gyro)
+        if yaw is None:
+            self._prev_yaw = None      # reset so a reconnect doesn't jump
+            return None, None
+        d = None if self._prev_yaw is None else yaw - self._prev_yaw
+        self._prev_yaw = yaw
+        return yaw, d
+
+    def teardown(self):
+        set_foward_motors_duty(self.motor, 0)      # motors FIRST, always
+        for fn in (getattr(self.encoders, "stop", None),
+                   getattr(self.gyro,     "stop", None),
+                   getattr(self.ultra,    "stop", None)):   # RPi.GPIO fallback
+            if fn is not None:                              # has no stop()
+                try:
+                    fn()
+                except Exception:                           # noqa: BLE001
+                    pass
+
+
+class RunState:
+    """Live state handed to a duty schedule on every tick."""
+    __slots__ = ("t", "dt", "phase", "duty", "d_center",
+                 "v_center", "v_avg", "w_gyro", "dist_cm", "aborted")
+
+    def __init__(self):
+        self.t = self.dt = self.d_center = 0.0
+        self.v_center = self.v_avg = 0.0
+        self.phase = ""
+        self.duty = 0
+        self.w_gyro = None
+        self.dist_cm = None
+        self.aborted = None
+
+
+# ---------------------------------------------------------------------------
+# Core sampling loop
+# ---------------------------------------------------------------------------
+def _sample_run(rig, writer, run_id, duty_fn, max_time,
+                apply_fn=set_foward_motors_duty, wall_guard=True):
+    """Drive `duty_fn` at FS and log one row per tick.
+
+    `apply_fn(motor, duty)` is how a duty reaches the wheels: forward drive for
+    the translational experiments, in-place spin for the heading one.
+
+    ORDER MATTERS: read -> log(duty_prev) -> decide -> apply.
+
+    read_reset_sides() returns the counts accrued SINCE THE PREVIOUS READ, i.e.
+    under the duty already in force -- duty_prev -- not the one about to be
+    written. Log the new duty on that row and the series sits one sample early;
+    at 50 Hz that is 20 ms, which against tau ~ 200 ms is a 10% error the ARX
+    fit absorbs silently as time constant. No fit diagnostic will flag it.
+
+    duty_fn(st) sets st.phase and returns the duty for the NEXT interval, or
+    None to end the run.
+    """
+    st  = RunState()
+    win = deque(maxlen=max(1, int(VEL_WIN_S * FS)))
+
+    duty = duty_fn(st)
+    if duty is None:
+        return st
+    apply_fn(rig.motor, duty)
+    st.duty = duty_prev = duty
+    phase_prev = st.phase
+
+    rig.encoders.read_reset_sides()      # discard anything accrued before t0
+    t0 = last = time.monotonic()
+    stop_evt.wait(TS)                    # so the first interval is a real one
+
+    while not stop_evt.is_set():
+        now = time.monotonic()
+        dt  = now - last
+        last = now
+        if dt <= 0.0:
+            dt = TS
+        st.t, st.dt = now - t0, dt
+
+        # -- 1. read: these counts accrued under duty_prev ------------------
+        dc_l, dc_r = rig.encoders.read_reset_sides()
+        d_left   = dc_l * rig.mpc
+        d_right  = dc_r * rig.mpc
+        d_center = (d_left + d_right) / 2.0
+
+        yaw, gyro_dtheta = rig.yaw_dtheta()
+        # For the translational runs theta is a diagnostic only -- it decides
+        # whether to KEEP the run. For the heading run w_gyro IS the output.
+        rig.odom.update_from_distances(d_left, d_right, dt, d_theta=gyro_dtheta)
+
+        st.d_center += d_center
+        st.v_center  = d_center / dt
+        win.append(st.v_center)
+        st.v_avg   = sum(win) / len(win)
+        st.w_gyro   = (gyro_dtheta / dt) if gyro_dtheta is not None else None
+
+        # -- 2. log: the row describes the interval that just ENDED ---------
+        writer.writerow([f"{st.t:.4f}", f"{dt:.5f}", run_id, phase_prev,
+                         duty_prev, f"{st.v_center:.5f}",
+                         f"{d_left / dt:.5f}", f"{d_right / dt:.5f}",
+                         "" if st.w_gyro is None else f"{st.w_gyro:.5f}",
+                         "" if yaw is None else f"{yaw:.5f}",
+                         f"{dc_l:.1f}", f"{dc_r:.1f}",
+                         rig.vbat(), f"{rig.odom.pose.theta:.4f}"])
+
+        # -- 3. aborts: safety interlock, not data --------------------------
+        if wall_guard:
+            st.dist_cm = rig.distance_cm()
+            if dist_ok(st.dist_cm) and st.dist_cm < WALL_STOP_CM:
+                st.aborted = "wall"
+                break
+        if st.t > max_time:
+            st.aborted = "timeout"
+            break
+
+        # -- 4. decide the NEXT interval, then apply ------------------------
+        duty = duty_fn(st)
+        if duty is None:
+            break
+        set_foward_motors_duty(rig.motor, duty)
+        st.duty = duty_prev = duty
+        phase_prev = st.phase
+
+        sleep = TS - (time.monotonic() - now)
+        if sleep > 0.0:
+            stop_evt.wait(sleep)
+
+    return st
+
+
+def _brake_and_settle(rig, seconds=0.8):
+    """Duty 0 is a BRAKE, not coast: Motor.py writes 4095 to BOTH channels,
+    shorting the motor terminals. Drain the counters afterwards so the braking
+    transient does not leak into the next run."""
+    set_foward_motors_duty(rig.motor, 0)
+    stop_evt.wait(seconds)
+    rig.encoders.read_reset_sides()
+
+
+def _pause(msg):
+    if not PAUSE_BETWEEN_RUNS or stop_evt.is_set():
+        return
+    try:
+        input(f"[pausa] {msg} -- ENTER para seguir (Ctrl+C aborta): ")
+    except (EOFError, KeyboardInterrupt):
+        stop_evt.set()
+
+
+# ---------------------------------------------------------------------------
+# Experiment 1: static (breakaway) threshold
+# ---------------------------------------------------------------------------
+def get_static_threshold(rig, writer, lo=400, hi=2200, step=100,
+                         pulse_s=0.6, repeats=3, move_min_m=0.01):
+    """Lowest duty that breaks the kart away FROM REST.
+
+    Each level is a short pulse from a standstill. Below threshold the kart does
+    not move at all, so the sweep costs almost no floor -- and it stops at the
+    first level that passes, before the kart starts covering real ground.
+
+    Breakaway is stochastic (where the gear teeth happen to sit, etc.), so a
+    level must move on ALL `repeats` pulses to count. One lucky breakaway is not
+    a threshold.
+
+    Returns the duty, or None if the sweep aborted / found nothing.
+    """
+    print(f"[static] varrendo {lo}..{hi} passo {step}, {repeats}x por nivel")
+    for duty in range(lo, hi + 1, step):
+        moved = 0
+        for r in range(repeats):
+            if stop_evt.is_set():
+                return None
+            _brake_and_settle(rig, 0.8)
+
+            def sched(st, _d=duty):
+                st.phase = "static_pulse"
+                return _d if st.t < pulse_s else None
+
+            st = _sample_run(rig, writer, f"static_u{duty}_r{r}",
+                             sched, max_time=pulse_s + 0.5)
+            if st.aborted == "wall":
+                print("[static] abortado: parede")
+                return None
+            print(f"[static]   duty={duty:5d} r={r}  "
+                  f"d_center={st.d_center * 1000:7.1f} mm")
+            if st.d_center > move_min_m:
+                moved += 1
+
+        if moved == repeats:
+            _brake_and_settle(rig, 0.5)
+            print(f"[static] THRESHOLD ESTATICO = {duty}")
+            return duty
+
+    print(f"[static] nenhum nivel ate {hi} moveu o kart")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Experiment 2: kinetic (dropout) threshold
+# ---------------------------------------------------------------------------
+def get_cinematic_threshold(rig, writer, u_start=3000, step=150, hold_s=0.35,
+                            warmup_s=1.0, u_floor=300, stall_ticks=4):
+    """Lowest duty that SUSTAINS motion once the kart is already rolling.
+
+    A DIFFERENT experiment from the static one, not a variation: static friction
+    is only measurable from rest, kinetic only while moving. So this run starts
+    moving and steps DOWN, and must never pass through duty 0 (which brakes,
+    injecting a nonlinear transient into the middle of the data).
+
+    Descending monotonically correlates duty with time, which normally biases
+    the fit through battery sag -- acceptable here only because the whole run
+    lasts a few seconds.
+
+    hold_s ~ 1.75*tau: settled enough to judge, short enough to fit the floor.
+
+    Returns the lowest duty that still sustained motion, or None if aborted.
+    """
+    state = {"duty": u_start, "t_step": warmup_s,
+             "stall": 0, "last_alive": u_start}
+
+    def sched(st):
+        if st.t < warmup_s:
+            st.phase = "warmup"
+            return u_start
+
+        st.phase = "descend"
+        if st.t - state["t_step"] >= hold_s:
+            state["duty"] -= step
+            state["t_step"] = st.t
+            state["stall"] = 0
+            if state["duty"] < u_floor:
+                return None
+
+        # Judge only after the step has had time to act, else you read the
+        # previous level's velocity and the threshold comes out too high.
+        if st.t - state["t_step"] > hold_s * 0.5:
+            if abs(st.v_avg) < MOVE_EPS_MPS:
+                state["stall"] += 1
+                if state["stall"] >= stall_ticks:
+                    return None
+            else:
+                state["stall"] = 0
+                state["last_alive"] = state["duty"]
+        return state["duty"]
+
+    max_t = warmup_s + ((u_start - u_floor) / float(step)) * hold_s + 1.0
+    st = _sample_run(rig, writer, f"kinetic_from{u_start}", sched,
+                     max_time=max_t)
+    _brake_and_settle(rig, 0.8)
+
+    if st.aborted == "wall":
+        print("[kinetic] abortado: parede (resultado nao confiavel)")
+        return None
+    print(f"[kinetic] THRESHOLD CINEMATICO = {state['last_alive']} "
+          f"(travou em {state['duty']}, {st.d_center:.2f} m de chao)")
+    return state["last_alive"]
+
+
+# ---------------------------------------------------------------------------
+# Experiment 3: PRBS excitation -> K and tau
+# ---------------------------------------------------------------------------
+# Maximum-length Galois LFSR tap masks, verified by brute force to give the full
+# 2^n - 1 period for every non-zero seed. Galois rather than Fibonacci because
+# the shift-and-conditional-xor form cannot collapse to the all-zero state.
+PRBS_TAPS = {6: 0x021, 7: 0x041, 9: 0x108}
+
+
+def prbs_bits(n_bits=6, seed=1):
+    """Galois LFSR, maximum-length sequence (period 2^n - 1).
+
+    Preferred over random.choice(): the sequence is balanced, its autocorrelation
+    is near-white (exactly the persistent-excitation property the fit needs), and
+    it is REPRODUCIBLE -- the same seed replays the same experiment.
+    """
+    mask = PRBS_TAPS[n_bits]
+    reg  = (seed & ((1 << n_bits) - 1)) or 1
+    while True:
+        lsb = reg & 1
+        reg >>= 1
+        if lsb:
+            reg ^= mask
+        yield lsb
+
+
+def PRBS(rig, writer, u_center=2500, u_amp=600, t_switch=0.10,
+         n_bits=6, seed=1, warmup_s=1.0, u_kinetic=None):
+    """Pseudo-random binary excitation at one operating point -- the run that
+    actually identifies K and tau.
+
+    A staircase spends nearly all its time on plateaus, which only re-measure K;
+    tau lives in the transients, so N steps give N looks at tau. This gives
+    2^n - 1 of them over the SAME stretch of floor, the binding constraint here.
+    n_bits=6 -> 63 bits * 0.10 s = 6.3 s, about 4 m.
+
+    t_switch belongs between tau/3 and tau: slower and the excitation is
+    quasi-static, so tau stops being identifiable (the same reason a ramp is
+    useless); faster and the plant cannot respond at all.
+
+    Both levels MUST clear the kinetic threshold. If the kart stalls mid-run the
+    record picks up static breakaway transients -- a different, nonlinear
+    dynamic than the one being fitted. Pass `u_kinetic` and this is checked.
+
+    Warm-up rows are logged but tagged phase="warmup": drop them offline. Their
+    job is to have the kart already AT the operating point when the prbs rows
+    begin, so no breakaway contaminates the identification data.
+    """
+    u_lo, u_hi = u_center - u_amp, u_center + u_amp
+    if u_kinetic is not None and u_lo <= u_kinetic:
+        raise ValueError(
+            f"u_center - u_amp = {u_lo} <= limiar cinetico {u_kinetic}: "
+            f"o kart trava no meio da corrida e contamina o ajuste")
+
+    gen    = prbs_bits(n_bits, seed)
+    t_prbs = ((1 << n_bits) - 1) * t_switch
+    state  = {"duty": u_center, "t_switch": warmup_s}
+
+    def sched(st):
+        if st.t < warmup_s:
+            st.phase = "warmup"
+            return u_center
+        if st.t > warmup_s + t_prbs:
+            return None
+        st.phase = "prbs"
+        if st.t - state["t_switch"] >= t_switch:
+            state["duty"] = u_hi if next(gen) else u_lo
+            state["t_switch"] = st.t
+        return state["duty"]
+
+    print(f"[prbs] u={u_center} +-{u_amp} ({u_lo}/{u_hi})  "
+          f"T_sw={t_switch * 1000:.0f} ms  {t_prbs:.1f} s")
+    st = _sample_run(rig, writer, f"prbs_u{u_center}_a{u_amp}_s{seed}",
+                     sched, max_time=warmup_s + t_prbs + 1.0)
+    _brake_and_settle(rig, 0.8)
+    print(f"[prbs]   t={st.t:.1f} s  chao={st.d_center:.2f} m  "
+          f"theta={math.degrees(rig.odom.pose.theta):+.1f} deg  "
+          f"abort={st.aborted}")
+    return st
+
+
+# ---------------------------------------------------------------------------
+# Experiment 4: PRBS on the heading axis -> K_w (and tau again)
+# ---------------------------------------------------------------------------
+def PRBS_heading(rig, writer, u_center=2800, u_amp=400, t_switch=0.10,
+                 n_bits=7, seed=1, warmup_s=1.0, u_turn_threshold=None):
+    """PRBS excitation of the ROTATION axis, in place.
+
+    Same identification as PRBS(), different plant:
+
+        tau * w_dot + w = K_w * (u - u0_turn)
+
+    with u applied as an in-place spin (left = -u, right = +u) and the output
+    w = yaw rate from the gyro, not v_center.
+
+    tau is EXPECTED to come out near the translational one and the gain to
+    change -- but fit it freely rather than pinning it: rotational inertia is
+    not mass, and an in-place skid turn is dominated by lateral tyre scrub
+    (Coulomb), which loads the motors differently than rolling does. Letting tau
+    float means the run CONFIRMS the assumption instead of hiding a violation
+    of it inside K_w.
+
+    Three things differ from the translational run:
+
+    1. NO FLOOR BUDGET. The kart spins in place instead of driving away, so the
+       binding constraint that forced n_bits=6 on PRBS() is gone. n_bits=7 ->
+       127 bits * 0.1 s = 12.7 s in the same square metre, which is the cheapest
+       variance reduction available anywhere in this rig. Raise it further if
+       the gyro bias holds.
+
+    2. The wall interlock is OFF by default. A spinning kart sweeps its front
+       sensor across the whole room, so seeing something at 20 cm is expected
+       and means nothing about collision -- leaving the guard on would abort
+       almost every run. The timeout and Ctrl+C remain.
+
+    3. Both levels must clear the TURN threshold, which is much higher than the
+       drive one: min_turn_duty is 2200 in HeadingGains against min_move_duty
+       1200, because an in-place skid must break lateral scrub on four tyres,
+       not just roll. Hence the 2800 +/- 400 default -- inside HeadingGains'
+       output_limit of 3200 and clear of 2200.
+
+    Unipolar (both levels the same sign), like the translational run: alternating
+    +u/-u would keep the heading near its start but cross the dead zone on every
+    single transition, injecting the exact nonlinearity being factored out. The
+    kart just keeps spinning instead, which costs nothing here.
+    """
+    if rig.gyro is None or not rig.gyro.is_connected():
+        raise RuntimeError(
+            "PRBS_heading precisa do gyro: w e a saida do modelo. O w derivado "
+            "dos encoders nao serve -- numa rotacao no lugar as quatro rodas "
+            "escorregam lateralmente, que e justamente por que o servidor trata "
+            "o gyro como ground truth para d_theta.")
+
+    u_lo, u_hi = u_center - u_amp, u_center + u_amp
+    if u_turn_threshold is not None and u_lo <= u_turn_threshold:
+        raise ValueError(
+            f"u_center - u_amp = {u_lo} <= limiar de giro {u_turn_threshold}: "
+            f"o kart para de girar no meio da corrida e contamina o ajuste")
+
+    gen    = prbs_bits(n_bits, seed)
+    t_prbs = ((1 << n_bits) - 1) * t_switch
+    state  = {"duty": u_center, "t_switch": warmup_s}
+
+    def sched(st):
+        if st.t < warmup_s:
+            st.phase = "warmup"
+            return u_center
+        if st.t > warmup_s + t_prbs:
+            return None
+        st.phase = "prbs_head"
+        if st.t - state["t_switch"] >= t_switch:
+            state["duty"] = u_hi if next(gen) else u_lo
+            state["t_switch"] = st.t
+        return state["duty"]
+
+    print(f"[prbs_head] u={u_center} +-{u_amp} ({u_lo}/{u_hi}) CCW  "
+          f"T_sw={t_switch * 1000:.0f} ms  {t_prbs:.1f} s")
+    st = _sample_run(rig, writer, f"prbs_head_u{u_center}_a{u_amp}_s{seed}",
+                     sched, max_time=warmup_s + t_prbs + 1.0,
+                     apply_fn=set_turn_motors_duty, wall_guard=False)
+    _brake_and_settle(rig, 1.0)
+    print(f"[prbs_head]   t={st.t:.1f} s  "
+          f"giro total={math.degrees(rig.odom.pose.theta):+.0f} deg  "
+          f"deriva={st.d_center:.2f} m  abort={st.aborted}")
+    return st
+
+
+# ---------------------------------------------------------------------------
+# CSV / entry point
+# ---------------------------------------------------------------------------
+def _open_csv(tag):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    path = os.path.join(DATA_DIR,
+                        f"gray_{tag}_{datetime.now():%Y%m%d_%H%M%S}.csv")
+    fh = open(path, "w", newline="")
+    w = csv.writer(fh)
+    w.writerow(CSV_HEADER)
+    print(f"[csv] {path}")
+    return fh, w, path
+
+
+def _install_signal_handlers():
+    def _on_signal(signum, frame):
+        stop_evt.set()
+        # Installing a handler stops Ctrl+C raising KeyboardInterrupt, so a
+        # wedged loop would be unkillable -- with motors running. Restore the
+        # default so the SECOND Ctrl+C always works.
+        signal.signal(signum, signal.SIG_DFL)
+    for s in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(s, _on_signal)
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(
+        description="Coleta de dados para identificacao cinza do PiKart.")
+    ap.add_argument("mode", choices=("static", "kinetic", "prbs",
+                                     "prbs_heading", "all", "smoke"))
+    ap.add_argument("--u-center", type=int, action="append",
+                    help="ponto de operacao do PRBS (repetivel; "
+                         "padrao 1500 2500 3500 no linear, 2800 no heading)")
+    ap.add_argument("--u-amp",     type=int,   default=600)
+    ap.add_argument("--t-switch",  type=float, default=0.10)
+    ap.add_argument("--u-kinetic", type=int,   default=None,
+                    help="limiar cinetico ja medido; valida os niveis do PRBS")
+    ap.add_argument("--u-turn",    type=int,   default=None,
+                    help="limiar de giro ja medido; valida o PRBS de heading")
+    ap.add_argument("--n-bits",    type=int,   default=None,
+                    choices=(6, 7, 9),
+                    help="comprimento da sequencia PRBS (2^n - 1 bits)")
+    ap.add_argument("--seed",      type=int,   default=1)
+    ap.add_argument("--no-pause",  action="store_true",
+                    help="nao espera o operador reposicionar entre corridas")
+    args = ap.parse_args()
+
+    PAUSE_BETWEEN_RUNS = not args.no_pause
+    _install_signal_handlers()
+
+    rig = Rig()
+    fh, writer, path = _open_csv(args.mode)
+    u_static = u_kin = None
+    try:
+        if args.mode == "smoke":
+            test_motors(rig)
+
+        if args.mode in ("static", "all"):
+            _pause("posicione o kart com ~1 m livre a frente")
+            u_static = get_static_threshold(rig, writer)
+
+        if args.mode in ("kinetic", "all"):
+            _pause("reposicione o kart com ~5 m livres a frente")
+            u_kin = get_cinematic_threshold(rig, writer)
+
+        if args.mode in ("prbs", "all"):
+            u_kin_check = args.u_kinetic if args.u_kinetic is not None else u_kin
+            for u in (args.u_center or [1500, 2500, 3500]):
+                if stop_evt.is_set():
+                    break
+                _pause(f"reposicione o kart com ~5 m livres (PRBS u={u})")
+                PRBS(rig, writer, u_center=u, u_amp=args.u_amp,
+                     t_switch=args.t_switch, seed=args.seed,
+                     n_bits=args.n_bits or 6, u_kinetic=u_kin_check)
+
+        if args.mode in ("prbs_heading", "all"):
+            for u in (args.u_center or [2800]):
+                if stop_evt.is_set():
+                    break
+                _pause(f"deixe ~1 m livre em volta do kart (giro u={u})")
+                PRBS_heading(rig, writer, u_center=u,
+                             u_amp=args.u_amp if args.u_center else 400,
+                             t_switch=args.t_switch, seed=args.seed,
+                             n_bits=args.n_bits or 7,
+                             u_turn_threshold=args.u_turn)
+    finally:
+        rig.teardown()
+        fh.close()
+        print(f"\n[resumo] estatico={u_static}  cinetico={u_kin}")
+        print(f"[csv] {path}")

@@ -147,7 +147,7 @@ v_left  = v − w · track/2
 v_right = v + w · track/2
 ```
 
-**Two control modes** (`drive_controller.py`), once per control tick :
+**Two control modes** (`drive_controller.py`), once per control tick:
 
 *Velocity mode* (teleop / `drive`): inverse-kinematics the target `Twist` →
 per-side target speed → per-side velocity `PID` (+feed-forward) → duty.
