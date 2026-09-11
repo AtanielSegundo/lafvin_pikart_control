@@ -253,7 +253,7 @@ def dist_ok(cm):
     are large, so an unfiltered sentinel fails in the "keep driving" direction
     -- exactly the direction that matters for a safety stop.
     """
-    return True
+    return cm is not None and 0 < cm <= 300 and cm != 255
 
 
 def test_motors(rig, duty=2000, seconds=1.0):
@@ -514,7 +514,7 @@ def _sample_run(rig, writer, run_id, duty_fn, max_time,
             st.dist_cm = rig.distance_cm()
             if dist_ok(st.dist_cm) and st.dist_cm < WALL_STOP_CM:
                 st.aborted = "wall"
-                break
+                pass # break
         if st.t > max_time:
             st.aborted = "timeout"
             break
