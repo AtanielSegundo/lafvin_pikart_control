@@ -129,11 +129,11 @@ class HeadingGains:
     integral_limit: float = 800.0
     # Deceleration ceiling, same idea as PositionGains.decel_gain: cap |duty| at
     # decel_gain*sqrt(|err|) so the approach follows w ~ sqrt(2*a*theta).
-    decel_gain    : float = 2200.0
-    min_turn_duty : float = 2200.0
+    decel_gain    : float = 1200.0
+    min_turn_duty : float = 1200.0
     pulse_floor   : bool  = False
     tolerance     : float = 0.008726646259971648 # 0.5 deg
-    settle_rate   : float = 0.4     # rad/s (~7 deg/s). Loosening this is the
+    settle_rate   : float = 0.12     # rad/s (~7 deg/s). Loosening this is the
                                      # fastest way to reintroduce overshoot: the
                                      # kart coasts for whatever rate it is still
                                      # carrying when the loop lets go.
