@@ -309,10 +309,26 @@ class WheelEncoders:
     def read_reset_sides(self) -> Tuple[float, float]:
         """Return (left, right) mean count deltas since the last call and
         reset every encoder."""
+        left, right, _raw = self.read_reset_detailed()
+        return left, right
+
+    def read_reset_detailed(self) -> Tuple[float, float, Dict[str, int]]:
+        """``read_reset_sides`` plus the RAW per-motor deltas that produced it.
+
+        Same single consumption of the counters -- calling this and
+        ``read_reset_sides`` for the same step would make them steal each
+        other's counts.
+
+        The raw dict is what makes a one-sided encoder failure visible: a side
+        is a MEAN, so one motor reporting zero while its partner runs just
+        halves the side and reads as a gentle curve, not as the dropout it is.
+        Diagnostics (gray_regression) log it per tick; the control loop has no
+        use for it and keeps calling read_reset_sides.
+        """
         raw = {tag: enc.read_reset() for tag, enc in self.encoders.items()}
         left = _mean(self._resolve(t, raw) for t in self.sides.left)
         right = _mean(self._resolve(t, raw) for t in self.sides.right)
-        return left, right
+        return left, right, raw
 
 
 def _mean(values: Iterable[float]) -> float:

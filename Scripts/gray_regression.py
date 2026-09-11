@@ -34,6 +34,32 @@ processes would drive PCA9685 0x40 over the same I2C bus.
     sudo systemctl stop <servico>
     sudo pigpiod                       # required by encoders + ultrasonic
     sudo python3 Scripts/gray_regression.py static
+
+THE BINDING CONSTRAINT IS THE ENCODER, NOT THE SAMPLE RATE
+----------------------------------------------------------
+Every edge from all four encoders is delivered to a PYTHON callback over
+pigpio's notification socket. At 2340 counts/rev x 4 motors, 0.7 m/s is already
+~34 000 callbacks/s, and past roughly ENC_MAX_CPS that path -- not the daemon --
+gives out: the loop period stretches in step with the edge rate, counts arrive
+in bursts, the quadrature state machine desynchronises and counts BACKWARDS, and
+whole ticks return zero with the kart at full power. config.py says the same
+thing from the other side, at PositionGains.output_limit: "at high duty (~3000)
+the wheel spins faster than the quadrature decoder tracks".
+
+So the PRBS operating point is bounded from ABOVE by the encoder, not only from
+below by the dead zone. u_center=2500 +-600 reaches duty 3100, which is inside
+the region config.py already documents as broken. Each run now prints an
+encoder verdict at the end (see _sample_run) -- read it before repositioning
+the kart, because that is when redoing the run is still cheap.
+
+  --lean-encoders   decode only M1 and M4: half the callbacks, and it drops
+                    M3's single-phase hack (borrowed direction, x2 fudge).
+  --fs              loop rate. Raising it does NOT buy resolution -- the edge
+                    rate is set by wheel speed -- it only slices the same edges
+                    into noisier buckets.
+
+Then fit with Scripts/regressors.py, which discretises each sample with its own
+dt and reports what is wrong with the data before it reports any gains.
 """
 import argparse
 import csv
@@ -61,7 +87,7 @@ if __SERVER not in sys.path:
 print(f"[PATH ADDED] {__SERVER}")
 
 from odometry   import SkidSteerOdometry
-from config     import CONFIG
+from config     import CONFIG, ENCODER_PINS, SideMapping
 from encoders   import WheelEncoders
 from Motor      import Motor
 from Ultrasonic import Ultrasonic
@@ -73,12 +99,42 @@ from Ultrasonic import Ultrasonic
 # samples per time constant -- too few to identify tau. The trade is velocity
 # quantisation (mpc/Ts: 1.7 mm/s at 20 Hz vs 4.4 mm/s at 50 Hz), but you can
 # always filter offline and never resample upwards.
+#
+# Overridable with --fs. Raising it does NOT buy resolution: the encoder edge
+# rate is set by wheel speed, not by this, so a shorter window only slices the
+# same edges into noisier buckets.
 FS            = 50.0
 TS            = 1.0 / FS
+
+# Encoder acquisition ceiling, counts/s summed over all decoded motors.
+#
+# pigpio services edges in the C daemon, but every edge is then delivered to a
+# PYTHON callback over the notification socket, where it takes the GIL and a
+# lock. That path -- not the daemon -- is the ceiling. Past it the loop period
+# stretches in step with the edge rate, counts arrive in bursts (a 65 ms tick
+# reporting 1718 counts = 2.4 m/s on a 0.6 m/s kart), the quadrature state
+# machine desynchronises and starts counting BACKWARDS under forward duty, and
+# whole ticks come back zero with the kart at full power. All four were present
+# in the reference run.
+#
+# 2340 counts/rev x 4 motors means 0.7 m/s is already ~34 kHz of callbacks.
+# This is a WARNING threshold, calibrated from the runs where the pathologies
+# start: treat a run that exceeds it as unfittable, not as merely noisy.
+#
+# Note also GLITCH_FILTER_US = 100 in encoders.py: it discards any level that
+# does not persist 100 us. At 0.7 m/s the mean edge spacing on one phase is
+# 249 us, so an encoder with an asymmetric duty cycle loses real edges there
+# too -- a second, independent undercount that grows with speed.
+ENC_MAX_CPS   = 20000.0
 
 # The ultrasonic is a SAFETY INTERLOCK ONLY -- it aborts a run when the wall gets
 # this close and never appears in the data. Y is v_center.
 WALL_STOP_CM  = 20
+# A v_center above this is not the kart, it is the counting: CONFIG saturates
+# drive commands at max_linear and the wheels cannot outrun that by much even
+# open-loop. Reference run: 49% of samples above it, peaking at 2.0 m/s.
+MAX_PLAUSIBLE_MPS = 1.5 * CONFIG.control.max_linear
+
 MOVE_EPS_MPS  = 0.03          # |v| below this counts as "not moving"
 VEL_WIN_S     = 0.10          # moving-average window for stall decisions
 
@@ -113,10 +169,15 @@ GYRO_FS_DEG   = 1000
 
 DATA_DIR = os.path.join(__HERE, "data")
 
+# The per-motor columns (c_M1..c_M4) are RAW signed deltas, before the side
+# mean. A side is an average of two motors, so one encoder dying reads as a
+# halved side -- i.e. as a gentle curve -- and is invisible in dc_left/dc_right
+# alone. These columns are how that failure becomes findable after the fact.
 CSV_HEADER = ["t", "dt", "run_id", "phase", "duty",
               "v_center", "v_left", "v_right",
               "w_gyro", "yaw",
-              "dc_left", "dc_right", "vbat", "theta"]
+              "dc_left", "dc_right", "vbat", "theta",
+              "c_M1", "c_M2", "c_M3", "c_M4"]
 
 stop_evt = threading.Event()
 PAUSE_BETWEEN_RUNS = True
@@ -203,14 +264,44 @@ def test_motors(rig, duty=2000, seconds=1.0):
     set_foward_motors_duty(rig.motor, 0)
 
 
+def lean_encoder_setup():
+    """(sides, pins) decoding ONE motor per side instead of all four.
+
+    Halves the pigpio callback rate, which is the acquisition ceiling (see
+    ENC_MAX_CPS). Picks M1 (left) and M4 (right): both are healthy x4
+    quadrature, so this also drops M3 entirely -- the single-phase motor whose
+    DIRECTION is borrowed from its partner and whose count is doubled to fake
+    x4 resolution. That borrowed direction is a guess, and when the partner
+    reads exactly zero it always guesses FORWARD, biasing the side.
+
+    The cost is that a side is no longer an average of two motors, so a single
+    slipping wheel is no longer smoothed. For identification that is a good
+    trade: a clean measurement of one wheel beats a corrupted mean of two.
+
+    Uses CONFIG's own signs so a wiring change stays in one place.
+    """
+    signs = dict(CONFIG.sides.signs)
+    sides = SideMapping(left=("M1",), right=("M4",), signs=signs)
+    pins  = {t: ENCODER_PINS[t] for t in ("M1", "M4")}
+    return sides, pins
+
+
 class Rig:
     """Everything the experiments touch, built once."""
 
-    def __init__(self):
+    def __init__(self, lean_encoders=False):
         self.motor    = Motor()
         self.ultra    = get_ultrasonic_handler()
         self.gyro     = get_gyro_handler()
-        self.encoders = WheelEncoders(CONFIG.sides)
+        if lean_encoders:
+            sides, pins = lean_encoder_setup()
+            # modes={} -> no single-phase handling; M3 is not decoded at all.
+            self.encoders = WheelEncoders(sides, pins=pins, modes={})
+            print("[encoders] modo enxuto: so M1 (esq) e M4 (dir) -- metade "
+                  "das callbacks, e sem o remendo de fase unica do M3")
+        else:
+            self.encoders = WheelEncoders(CONFIG.sides)
+        self.enc_tags = tuple(self.encoders.encoders)
         self.encoders.begin()          # registers the pigpio edge callbacks --
                                        # without it every count stays 0 forever
         self.odom     = SkidSteerOdometry(CONFIG.wheel)
@@ -338,6 +429,11 @@ def _sample_run(rig, writer, run_id, duty_fn, max_time,
     ticks = 0
     dt_max = 0.0
     w_peak = 0.0
+    # Acquisition pathologies, counted live so a bad run is known BEFORE the
+    # kart is repositioned for the next one -- not weeks later in the fit.
+    cps_peak = 0.0
+    over_cps = impossible = stalled = reversed_ = lopsided = 0
+    translational = apply_fn is set_foward_motors_duty
 
     duty = duty_fn(st)
     if duty is None:
@@ -351,6 +447,16 @@ def _sample_run(rig, writer, run_id, duty_fn, max_time,
     stop_evt.wait(TS)                    # so the first interval is a real one
 
     while not stop_evt.is_set():
+        # -- 1. read FIRST, and take the timestamp FROM the read ------------
+        # dt has to be the window the COUNTS accrued over. read_reset_sides
+        # returns everything since the PREVIOUS read, so the counting window
+        # runs read-to-read -- while the old code measured loop-top to
+        # loop-top. Everything in between (writerow, the ultrasonic ping, the
+        # 32-byte I2C duty write, the sleep) has variable cost, so v =
+        # counts*mpc/dt was dividing a count from one interval by the length
+        # of a slightly different one. Timestamping at the read removes that
+        # by construction; it costs nothing.
+        dc_l, dc_r, raw = rig.encoders.read_reset_detailed()
         now = time.monotonic()
         dt  = now - last
         last = now
@@ -360,11 +466,25 @@ def _sample_run(rig, writer, run_id, duty_fn, max_time,
         ticks += 1
         dt_max = max(dt_max, dt)
 
-        # -- 1. read: these counts accrued under duty_prev ------------------
-        dc_l, dc_r = rig.encoders.read_reset_sides()
         d_left   = dc_l * rig.mpc
         d_right  = dc_r * rig.mpc
         d_center = (d_left + d_right) / 2.0
+
+        # Acquisition health, judged per tick and reported once at the end.
+        cps = sum(abs(v) for v in raw.values()) / dt
+        cps_peak = max(cps_peak, cps)
+        if cps > ENC_MAX_CPS:
+            over_cps += 1
+        if abs(d_center / dt) > MAX_PLAUSIBLE_MPS:
+            impossible += 1
+        if translational and duty_prev > CONFIG.position.min_move_duty:
+            if abs(dc_l) < 2.0 and abs(dc_r) < 2.0:
+                stalled += 1        # full duty, zero counts: stream died
+            if dc_l < -5.0 or dc_r < -5.0:
+                reversed_ += 1      # backwards under forward duty: state lost
+        vals = [abs(v) for v in raw.values()]
+        if len(vals) > 1 and max(vals) > 80.0 and min(vals) < 0.1 * max(vals):
+            lopsided += 1           # one motor running, its partner silent
 
         yaw, gyro_dtheta, w_gyro = rig.yaw_sample()
         # For the translational runs theta is a diagnostic only -- it decides
@@ -386,7 +506,8 @@ def _sample_run(rig, writer, run_id, duty_fn, max_time,
                          "" if st.w_gyro is None else f"{st.w_gyro:.5f}",
                          "" if yaw is None else f"{yaw:.5f}",
                          f"{dc_l:.1f}", f"{dc_r:.1f}",
-                         rig.vbat(), f"{rig.odom.pose.theta:.4f}"])
+                         rig.vbat(), f"{rig.odom.pose.theta:.4f}"]
+                        + [raw.get(t, "") for t in ("M1", "M2", "M3", "M4")])
 
         # -- 3. aborts: safety interlock, not data --------------------------
         if wall_guard:
@@ -435,6 +556,37 @@ def _sample_run(rig, writer, run_id, duty_fn, max_time,
                   f"de escala do gyro -- suba GYRO_FS_DEG (hoje {GYRO_FS_DEG}) "
                   f"ou baixe o duty; acima da faixa a leitura satura e os dados "
                   f"de heading nao valem")
+
+        # -- encoder acquisition verdict ---------------------------------
+        # Said HERE, at the end of the run, because that is when it is still
+        # cheap to act on: the kart has not been repositioned yet and the run
+        # can simply be redone slower. The same faults found offline cost a
+        # whole session.
+        print(f"  [enc]  pico {cps_peak:.0f} contagens/s "
+              f"(teto {ENC_MAX_CPS:.0f}); acima do teto em {over_cps}/{ticks} "
+              f"ticks")
+        faults = []
+        if over_cps > ticks // 20:
+            faults.append(f"{over_cps} ticks acima do teto de contagem")
+        if impossible:
+            faults.append(f"{impossible} ticks com |v| > {MAX_PLAUSIBLE_MPS:.2f} "
+                          f"m/s (impossivel)")
+        if stalled:
+            faults.append(f"{stalled} ticks com ZERO contagem e duty de avanco")
+        if reversed_:
+            faults.append(f"{reversed_} ticks contando para TRAS com duty de "
+                          f"avanco")
+        if lopsided:
+            faults.append(f"{lopsided} ticks com um motor parado e o parceiro "
+                          f"girando")
+        if faults:
+            print("  [enc]  AVISO: aquisicao de encoder degradada -- "
+                  + "; ".join(faults))
+            print("  [enc]  Esta corrida provavelmente NAO e ajustavel. As "
+                  "bordas chegam por callback Python do pigpio: acima de ~"
+                  f"{ENC_MAX_CPS:.0f} contagens/s elas atrasam, chegam em "
+                  "rajada e a quadratura perde o estado. Reduza o duty, use "
+                  "--lean-encoders (metade das callbacks), ou ambos.")
     return st
 
 
@@ -746,6 +898,31 @@ def _open_csv(tag):
     return fh, w, path
 
 
+def check_levels(kind, u_lo, threshold, measured):
+    """Warn (or refuse) when the PRBS low level sits in the dead zone.
+
+    Below the threshold the kart is not a first-order plant, it is static
+    friction: no tau explains those samples, and they are typically half the
+    record. A MEASURED threshold is a fact, so violating it aborts; a threshold
+    taken from config is an assumption, so it only warns -- refusing on a guess
+    would block legitimate runs on a re-tuned build.
+    """
+    if threshold is None or u_lo > threshold:
+        return
+    msg = (f"o nivel BAIXO do PRBS ({u_lo}) esta em ou abaixo do limiar de "
+           f"{kind} ({threshold}): o kart cai na zona morta no meio da corrida "
+           f"e contamina o ajuste")
+    if measured:
+        raise ValueError(msg)
+    print()
+    print(f"  !! AVISO: {msg}.")
+    print( "     O limiar veio do config.py, nao de uma medicao -- rode o "
+           "experimento static/kinetic para saber")
+    print( "     o valor real desta montagem, ou suba --u-center / baixe "
+           "--u-amp.")
+    print()
+
+
 def _install_signal_handlers():
     def _on_signal(signum, frame):
         stop_evt.set()
@@ -765,8 +942,27 @@ if __name__ == "__main__":
     ap.add_argument("--u-center", type=int, action="append",
                     help="ponto de operacao do PRBS (repetivel; "
                          "padrao 1500 2500 3500 no linear, 2800 no heading)")
-    ap.add_argument("--u-amp",     type=int,   default=600)
+    # Per-mode default, NOT a shared 600. The old code read
+    #   u_amp = args.u_amp if args.u_center else 400
+    # so the heading default of 400 applied ONLY when --u-center was absent;
+    # passing --u-center 1250 silently took the translational 600 instead and
+    # put the low level at 650 -- a third of min_turn_duty, i.e. the kart
+    # sitting in stiction for half the record. Left as None it now resolves
+    # per experiment, so choosing an operating point cannot change the
+    # amplitude behind your back.
+    ap.add_argument("--u-amp",     type=int,   default=None,
+                    help="amplitude do PRBS (padrao: 600 no linear, "
+                         "400 no heading)")
     ap.add_argument("--t-switch",  type=float, default=0.10)
+    ap.add_argument("--fs",        type=float, default=FS,
+                    help=f"taxa de amostragem do laco em Hz (padrao {FS:g}). "
+                         f"Subir isto NAO melhora a resolucao: a taxa de "
+                         f"bordas do encoder depende da velocidade da roda, "
+                         f"nao daqui.")
+    ap.add_argument("--lean-encoders", action="store_true",
+                    help="decodifica so M1 (esq) e M4 (dir) em vez dos quatro "
+                         "motores: metade das callbacks do pigpio, e sem o "
+                         "remendo de fase unica do M3")
     ap.add_argument("--u-kinetic", type=int,   default=None,
                     help="limiar cinetico ja medido; valida os niveis do PRBS")
     ap.add_argument("--u-turn",    type=int,   default=None,
@@ -780,9 +976,11 @@ if __name__ == "__main__":
     args = ap.parse_args()
 
     PAUSE_BETWEEN_RUNS = not args.no_pause
+    FS = float(args.fs)
+    TS = 1.0 / FS
     _install_signal_handlers()
 
-    rig = Rig()
+    rig = Rig(lean_encoders=args.lean_encoders)
     fh, writer, path = _open_csv(args.mode)
     u_static = u_kin = None
     try:
@@ -798,22 +996,36 @@ if __name__ == "__main__":
             u_kin = get_cinematic_threshold(rig, writer)
 
         if args.mode in ("prbs", "all"):
+            # Provenance matters: a threshold this session MEASURED (or the
+            # operator passed) is a fact and aborts the run; the config value is
+            # an assumption and only warns.
             u_kin_check = args.u_kinetic if args.u_kinetic is not None else u_kin
+            measured = u_kin_check is not None
+            if u_kin_check is None:
+                u_kin_check = CONFIG.position.min_move_duty
+            amp = args.u_amp if args.u_amp is not None else 600
             for u in (args.u_center or [1500, 2500, 3500]):
                 if stop_evt.is_set():
                     break
+                check_levels("movimento", u - amp, u_kin_check, measured)
                 _pause(f"reposicione o kart com ~5 m livres (PRBS u={u})")
-                PRBS(rig, writer, u_center=u, u_amp=args.u_amp,
+                PRBS(rig, writer, u_center=u, u_amp=amp,
                      t_switch=args.t_switch, seed=args.seed,
-                     n_bits=args.n_bits or 6, u_kinetic=u_kin_check)
+                     n_bits=args.n_bits or 6,
+                     u_kinetic=u_kin_check if measured else None)
 
         if args.mode in ("prbs_heading", "all"):
+            u_turn_check = args.u_turn
+            measured = u_turn_check is not None
+            if u_turn_check is None:
+                u_turn_check = CONFIG.heading.min_turn_duty
+            amp = args.u_amp if args.u_amp is not None else 400
             for u in (args.u_center or [2800]):
                 if stop_evt.is_set():
                     break
+                check_levels("giro", u - amp, u_turn_check, measured)
                 _pause(f"deixe ~1 m livre em volta do kart (giro u={u})")
-                PRBS_heading(rig, writer, u_center=u,
-                             u_amp=args.u_amp if args.u_center else 400,
+                PRBS_heading(rig, writer, u_center=u, u_amp=amp,
                              t_switch=args.t_switch, seed=args.seed,
                              n_bits=args.n_bits or 7,
                              u_turn_threshold=args.u_turn)
@@ -824,4 +1036,4 @@ if __name__ == "__main__":
         print(f"[csv] {path}")
 
 # THRESHOLD ESTATICO = 800
-# 
+# TRESHOLF CINEMATICO = 1200
