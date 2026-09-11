@@ -117,7 +117,7 @@ class PositionGains:
 @dataclass(frozen=True)
 class HeadingGains:
     kp: float = 9308.24        # duty per rad of heading error
-    ki: float = 20359.7       # gentle backstop for a residual degree or two;
+    ki: float = 10359.7       # gentle backstop for a residual degree or two;
                               # bounded by integral_limit below
     kd: float = 2054.4        # duty per (rad/s) -- damping. THE anti-overshoot
                               # term: raise it if the kart still swings past,
