@@ -125,15 +125,15 @@ class HeadingGains:
                               # deliberately large -- it has to command REVERSE
                               # duty to brake, since coasting alone carries the
                               # kart tens of degrees past the target.
-    output_limit  : float = 3200.0
+    output_limit  : float = 3600.0
     integral_limit: float = 800.0
     # Deceleration ceiling, same idea as PositionGains.decel_gain: cap |duty| at
     # decel_gain*sqrt(|err|) so the approach follows w ~ sqrt(2*a*theta).
     decel_gain    : float = 1600.0
     min_turn_duty : float = 2200.0
-    pulse_floor   : bool  = False
+    pulse_floor   : bool  = True
     tolerance     : float = 0.008726646259971648 # 0.5 deg
-    settle_rate   : float = 0.12     # rad/s (~7 deg/s). Loosening this is the
+    settle_rate   : float = 0.4     # rad/s (~7 deg/s). Loosening this is the
                                      # fastest way to reintroduce overshoot: the
                                      # kart coasts for whatever rate it is still
                                      # carrying when the loop lets go.
