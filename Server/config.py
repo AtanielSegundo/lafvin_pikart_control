@@ -116,8 +116,8 @@ class PositionGains:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class HeadingGains:
-    kp: float = 9308.24        # duty per rad of heading error
-    ki: float = 10359.7       # gentle backstop for a residual degree or two;
+    kp: float = 9308.24       # duty per rad of heading error
+    ki: float = 10359.7/2     # gentle backstop for a residual degree or two;
                               # bounded by integral_limit below
     kd: float = 2054.4        # duty per (rad/s) -- damping. THE anti-overshoot
                               # term: raise it if the kart still swings past,
@@ -133,7 +133,7 @@ class HeadingGains:
     min_turn_duty : float = 1200.0
     pulse_floor   : bool  = True
     tolerance     : float = 0.008726646259971648 # 0.5 deg
-    settle_rate   : float = 0.4     # rad/s (~7 deg/s). Loosening this is the
+    settle_rate   : float = 1.2     # rad/s (~7 deg/s). Loosening this is the
                                      # fastest way to reintroduce overshoot: the
                                      # kart coasts for whatever rate it is still
                                      # carrying when the loop lets go.
