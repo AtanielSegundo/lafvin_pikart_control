@@ -42,7 +42,7 @@ SAMPLE_HZ    = 50.0        # integration rate (Hz). Keep high for turns.
 # Which integrated axis is the robot's YAW, and its sign, given how the board is
 # mounted.
 YAW_AXIS = "z"
-YAW_SIGN = -1
+YAW_SIGN = 1
 
 GRAVITY_MS2  = 9.80665
 CAL_CACHE    = os.path.join(os.path.dirname(os.path.abspath(__file__)),".mpu6050_cal.json")
