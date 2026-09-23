@@ -615,7 +615,7 @@ function sendGoto() {
   const t = document.getElementById('gotoT').value;
   const msg = { type: 'goto', x: +x.toFixed(3), y: +y.toFixed(3) };
   if (t !== '') msg.theta = +parseFloat(t).toFixed(1);   // optional final heading
-  send(JSON.stringify(msg));
+send  (JSON.stringify(msg));
 }
 
 // --- Encoder-sign calibration ---
