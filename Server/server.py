@@ -1,122 +1,126 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
-import io
+"""
+The ``Server`` facade: command ingestion, telemetry fan-out, transports.
+
+This class used to *be* the robot -- it constructed the motors, the encoders, the
+gyro, the camera and the drive controller, and ran a dozen threads over them. It
+is now a facade in P_web that owns no hardware at all. Its job is:
+
+  * parse an incoming command (legacy ``CMD_*#...`` text or JSON) once, decide
+    which subsystem owns it, and enqueue it;
+  * compose a telemetry snapshot from what the children publish;
+  * serve the legacy TCP transports and the battery monitor.
+
+What that buys, concretely: the aiohttp event loop no longer shares a GIL with
+the pigpio encoder callbacks or the 20 Hz control loop. What it costs: one queue
+hop (~50-200 us) on the command path, which is noise against the 50 ms control
+period -- but it does mean ``command_timeout`` now measures web-to-control
+latency too, so commands are timestamped at ingress.
+
+Mode ownership stays here. P_control applies what it is told and does not
+second-guess it; refusing a drive command because the kart is in line-following
+mode is this layer's call, made before the command is ever enqueued.
+"""
+import fcntl
 import math
 import socket
-import numpy as np
 import struct
-import time
-from picamera2 import Picamera2, Preview
-from picamera2.encoders import JpegEncoder
-from picamera2.outputs import FileOutput
-from picamera2.encoders import Quality
-from threading import Condition
-import fcntl
-import sys
 import threading
-from Motor import *
-from servo import *
-from Led import *
-from Buzzer import *
-from ADC import *
-from Thread import *
-from Light import *
-from Ultrasonic import *
-from Line_Tracking import *
-from threading import Timer
-from threading import Thread
+import time
+
 from Command import COMMAND as cmd
-import RPi.GPIO as GPIO
-
 from config import CONFIG
-from protocol import CommandRouter, Command
-from encoders import WheelEncoders
-from drive_controller import DriveController
+import ipc as ipc_mod
+from protocol import Command, CommandRouter
+from supervisor import Supervisor
 
 
-class StreamingOutput(io.BufferedIOBase):
-    def __init__(self):
-        self.frame = None
-        self.condition = Condition()
+class FrameReader:
+    """A viewer's cursor into the shared camera ring.
 
-    def write(self, buf):
-        with self.condition:
-            self.frame = buf
-            self.condition.notify_all()
+    Each consumer keeps its own sequence number, so a slow viewer falls behind
+    and skips frames instead of throttling the camera or the other viewers --
+    which is what happened when everyone waited on one shared Condition and read
+    one shared ``frame`` attribute.
+    """
+
+    def __init__(self, server: "Server", ring: ipc_mod.FrameRing):
+        self._server = server
+        self._ring = ring
+        self.seq = 0
+        self._closed = False
+
+    def read(self, timeout: float = 2.0):
+        """Next frame as JPEG bytes, or None on timeout (so the caller can
+        re-check whether its client is still there)."""
+        data, self.seq = self._ring.read(self.seq, timeout=timeout)
+        return data
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._server.release_camera()
 
 
 class Server:
-    def __init__(self):
-        self.PWM        = Motor()
-        self.servo      = Servo()
-        self.led        = Led()
-        
-        try:
-            from ultrasonic_pigpio import UltrasonicPigpio
-            self.ultrasonic = UltrasonicPigpio()
-            print("[ultrasonic] using pigpio (hardware-timed echo)")
-        except Exception as e:
-            print(f"[ultrasonic] pigpio unavailable ({e}); RPi.GPIO fallback")
-            self.ultrasonic = Ultrasonic()
-        
-        self.buzzer     = Buzzer()
-        self.adc        = Adc()
-        self.light      = Light()
-        self.infrared   = Line_Tracking()
-        self.tcp_Flag   = True
-        self.sonic            = False
-        self.Light            = False
-        self.Line             = False
-        self.Mode             = 'one'
-        self.endChar          = '\n'
-        self.intervalChar     = '#'
-        self.rotation_flag    = False
-        self.cmd_lock         = threading.Lock()
+    def __init__(self, *, with_camera: bool = True, with_aux: bool = True,
+                 config=CONFIG):
+        self.config = config
+        self.tcp_Flag = True
+        self.sonic = False
+        self.Light = False
+        self.Line = False
+        self.Mode = 'one'
+        self.endChar = '\n'
+        self.intervalChar = '#'
+        self.rotation_flag = False
+        self.cmd_lock = threading.Lock()     # guards this facade's own flags
 
-        # --- estado da câmera, protegido por lock ---
-        self.camera           = None
-        self.streaming_output = None
-        self.camera_lock      = threading.Lock()
-        self.camera_refcount  = 0          # quantos consumidores querem a câmera ligada
+        # --- listening sockets (created once, never closed at runtime) ---
+        self.server_socket = None            # video    (port 8000)
+        self.server_socket1 = None           # commands (port 5000)
+        self.connection1 = None              # active command connection
 
-        # --- sockets de escuta (criados uma vez, nunca fechados em runtime) ---
-        self.server_socket    = None       # vídeo  (porta 8000)
-        self.server_socket1   = None       # comandos (porta 5000)
+        # --- camera reference counting (the count belongs to whoever has the
+        #     viewers; P_camera only ever sees start/stop) ---
+        self.camera_lock = threading.Lock()
+        self.camera_refcount = 0
 
-        # --- conexão de comandos ativa (usada por send()) ---
-        self.connection1      = None
+        # --- latest telemetry envelope from P_control ---
+        self._telemetry_lock = threading.Lock()
+        self._last_drive = None
+        self._last_servo = {}
+        self._last_signs = dict(config.sides.signs)
+        self._last_control_ts = 0.0
 
-        # --- MPU6050 heading (gyro): ground truth for rotation. Optional. ---
-        try:
-            from heading import GyroMPU
-            self.gyro = GyroMPU(sample_rate=50.0)
-            if self.gyro.is_connected():
-                print("[gyro] calibrating bias -- keep the kart STILL...")
-                self.gyro.calibrate()
-            else:
-                print("[gyro] MPU6050 not detected; heading falls back to encoders")
-        except Exception as e:                      # noqa: BLE001
-            print(f"[gyro] unavailable ({e}); heading falls back to encoders")
-            self.gyro = None
+        # ------------------------------------------------------------------
+        # Fork the children BEFORE starting any thread in this process.
+        # Forking a threaded parent inherits locks in whatever state they were
+        # in, so a child can deadlock on a mutex whose owner does not exist in
+        # it. Everything below this point may start threads; nothing above may.
+        # ------------------------------------------------------------------
+        self.ipc = ipc_mod.IPC(config)
+        self.supervisor = Supervisor(self.ipc, config, with_camera=with_camera,
+                                     with_aux=with_aux)
+        self.supervisor.start()
 
-        # --- closed-loop drivetrain (encoders + odometry + PID) ---
-        self.encoders  = WheelEncoders(CONFIG.sides)
-        self.drive     = DriveController(self.PWM, self.encoders,
-                                         config=CONFIG, dist_sensor=self.ultrasonic,
-                                         gyro=self.gyro)
-        self._rotate_thread = None
-        try:
-            self.drive.start()   # begins encoder listening + control loop
-        except Exception as e:
-            print(f"DriveController failed to start: {e}")
+        self._stop_evt = threading.Event()
+        self.supervisor.start_monitors()
+        threading.Thread(target=self._drain_telemetry, daemon=True,
+                         name="TelemetryDrain").start()
+        threading.Thread(target=self._legacy_sensor_publisher, daemon=True,
+                         name="LegacySensors").start()
 
         # --- extensible command routing ---
         self.router = CommandRouter()
         self._build_router()
 
     # ------------------------------------------------------------------
-    # Command handler registration (replaces the old if/elif chain).
-    # Adding a command = register one handler here.
+    # Command handler registration.
+    # Every handler now ENQUEUES to the process that owns the device rather
+    # than touching it. Adding a command is still "register one handler here",
+    # plus a matching handler in that process's applier.
     # ------------------------------------------------------------------
     def _build_router(self):
         r = self.router
@@ -140,6 +144,27 @@ class Server:
         r.register('power',          self._h_power)
         r.register('mode',           self._h_mode)
 
+    # ------------------------------------------------------------------
+    # Queue helpers
+    # ------------------------------------------------------------------
+    def _to_control(self, name: str, **kwargs) -> None:
+        # Stamped at ingress: the control loop's staleness test
+        # (control.command_timeout) should measure the age of the operator's
+        # intent, not the moment the queue happened to be drained.
+        kwargs.setdefault('ts', time.monotonic())
+        ipc_mod.put_drop_oldest(self.ipc.control_q,
+                                Command(name=name, kwargs=kwargs))
+
+    def _to_aux(self, name: str, **kwargs) -> None:
+        ipc_mod.put_drop_oldest(self.ipc.aux_q, Command(name=name, kwargs=kwargs))
+
+    def _to_sensors(self, name: str, **kwargs) -> None:
+        ipc_mod.put_drop_oldest(self.ipc.sensors_q,
+                                Command(name=name, kwargs=kwargs))
+
+    # ------------------------------------------------------------------
+    # Networking
+    # ------------------------------------------------------------------
     def get_interface_ip(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         return socket.inet_ntoa(fcntl.ioctl(s.fileno(),
@@ -185,61 +210,39 @@ class Server:
             pass
 
     # ------------------------------------------------------------------
-    # Câmera com contagem de referência
+    # Câmera (refcounted here; the device lives in P_camera)
     # ------------------------------------------------------------------
-    def acquire_camera(self):
-        """Liga a câmera se ainda não estiver ligada e incrementa o refcount.
-        Retorna o StreamingOutput compartilhado."""
+    def acquire_camera(self) -> FrameReader:
+        """Ask P_camera to run and return a private cursor into the frame ring."""
         with self.camera_lock:
-            if self.camera is None:
-                self.camera = Picamera2()
-                self.camera.configure(
-                    self.camera.create_video_configuration(main={"size": (400, 300)}))
-                self.streaming_output = StreamingOutput()
-                encoder = JpegEncoder(q=90)
-                self.camera.start_recording(
-                    encoder, FileOutput(self.streaming_output), quality=Quality.VERY_HIGH)
-                print("Camera started")
+            if self.camera_refcount == 0:
+                ipc_mod.put_drop_oldest(self.ipc.camera_q, {"action": "start"})
             self.camera_refcount += 1
-            return self.streaming_output
+        return FrameReader(self, self.ipc.frames)
 
-    def release_camera(self):
-        """Decrementa o refcount; desliga a câmera só quando o último sair."""
+    def release_camera(self) -> None:
         with self.camera_lock:
             if self.camera_refcount > 0:
                 self.camera_refcount -= 1
-            if self.camera_refcount == 0 and self.camera is not None:
-                try:
-                    self.camera.stop_recording()
-                    self.camera.close()
-                except Exception:
-                    pass
-                self.camera = None
-                self.streaming_output = None
-                print("Camera stopped")
+            if self.camera_refcount == 0:
+                ipc_mod.put_drop_oldest(self.ipc.camera_q, {"action": "stop"})
 
-    # Compatibilidade com web.py (mantém a API antiga)
-    def start_camera(self):
-        """Compat: garante câmera ligada sem mexer no refcount de longa duração.
-        web.py chama isto a cada requisição /video; o release ocorre lá."""
+    # Compat with the old API.
+    def start_camera(self) -> FrameReader:
         return self.acquire_camera()
 
-    def stop_camera(self):
-        """Compat: força desligamento total (usado no shutdown)."""
+    def stop_camera(self) -> None:
+        """Force the camera off regardless of the reference count (shutdown)."""
         with self.camera_lock:
             self.camera_refcount = 0
-            if self.camera is not None:
-                try:
-                    self.camera.stop_recording()
-                    self.camera.close()
-                except Exception:
-                    pass
-                self.camera = None
-                self.streaming_output = None
-                print("Camera stopped")
+        ipc_mod.put_drop_oldest(self.ipc.camera_q, {"action": "stop"})
+
+    @property
+    def camera_running(self) -> bool:
+        return bool(self.ipc.camera_state[0])
 
     # ------------------------------------------------------------------
-    # Laços de aceitação persistentes (substituem o antigo Reset)
+    # Laços de aceitação persistentes
     # ------------------------------------------------------------------
     def sendvideo(self):
         """Laço persistente: aceita um cliente de vídeo, transmite até cair,
@@ -248,26 +251,22 @@ class Server:
             try:
                 conn, client_address = self.server_socket.accept()
             except OSError:
-                # socket de escuta foi fechado (shutdown) -> encerra o laço
-                break
+                break                     # listening socket closed -> shutdown
 
             print("socket video connected ...")
             stream = conn.makefile('wb')
-            output = self.acquire_camera()
+            reader = self.acquire_camera()
             try:
                 while self.tcp_Flag:
-                    with output.condition:
-                        output.condition.wait(timeout=2.0)
-                        frame = output.frame
+                    frame = reader.read(timeout=2.0)
                     if frame is None:
                         continue
-                    lengthBin = struct.pack('<I', len(frame))
-                    stream.write(lengthBin)
+                    stream.write(struct.pack('<I', len(frame)))
                     stream.write(frame)
             except (OSError, BrokenPipeError):
                 print("End transmit ...")
             finally:
-                self.release_camera()
+                reader.close()
                 try:
                     stream.close()
                     conn.close()
@@ -292,11 +291,9 @@ class Server:
                     except OSError:
                         break
                     if chunk == '':
-                        # cliente desconectou de forma limpa
-                        break
+                        break             # clean client disconnect
 
                     AllData = restCmd + chunk
-                    print(AllData)
                     restCmd = ""
 
                     cmdArray = AllData.split("\n")
@@ -317,27 +314,21 @@ class Server:
                 self.connection1 = None
                 print("Client disconnected, waiting for new connection ...")
 
+    # ------------------------------------------------------------------
+    # Modes
+    # ------------------------------------------------------------------
     def stopMode(self):
-        # Hand motor control back to the loop-free state and stop any rotation.
+        """Leave whatever autonomous mode is running and hand the motors back.
+
+        The old version called ``stop_thread()`` on each mode thread -- ctypes
+        injection of SystemExit, seven times, which could land mid-I2C-write. The
+        modes now live in P_aux and stop on an event, and P_control is told to
+        release and brake regardless of whether P_aux answered.
+        """
         self._stop_rotation()
-        self.drive.release()
-        try:
-            stop_thread(self.infraredRun)
-            self.PWM.setMotorModel(0, 0, 0, 0)
-        except:
-            pass
-        try:
-            stop_thread(self.lightRun)
-            self.PWM.setMotorModel(0, 0, 0, 0)
-        except:
-            pass
-        try:
-            stop_thread(self.ultrasonicRun)
-            self.PWM.setMotorModel(0, 0, 0, 0)
-            self.servo.setServoPwm('0', 90)
-            self.servo.setServoPwm('1', 90)
-        except:
-            pass
+        self._to_aux('stop_mode')
+        self._to_control('release')
+        self._to_control('motor', duty=[0, 0, 0, 0])
         self.sonic = False
         self.Light = False
         self.Line = False
@@ -345,6 +336,14 @@ class Server:
         self.send('CMD_MODE' + '#3' + '#' + '0' + '\n')
         self.send('CMD_MODE' + '#2' + '#' + '000' + '\n')
 
+    def _stop_rotation(self):
+        """Stop a CMD_CAR_ROTATE spin."""
+        self.rotation_flag = False
+        self._to_control('car_rotate', stop=True)
+
+    # ------------------------------------------------------------------
+    # Dispatch
+    # ------------------------------------------------------------------
     def dispatch_command(self, oneCmd):
         """Handle a single command (legacy text or JSON), via the router.
 
@@ -356,34 +355,118 @@ class Server:
             except Exception as e:
                 print(f"dispatch error for {oneCmd!r}: {e}")
 
+    # ------------------------------------------------------------------
+    # Telemetry
+    # ------------------------------------------------------------------
+    def _drain_telemetry(self):
+        """Keep the newest control snapshot handy for the broadcaster.
+
+        The control loop pushes to a bounded queue and never blocks on it; this
+        thread keeps only the latest envelope. A queue rather than a packed
+        shared struct because at 20 Hz the pickle costs well under a millisecond
+        and nested telemetry (phase names, None-able fields) would otherwise need
+        a hand-rolled binary layout maintained in two places.
+        """
+        while not self._stop_evt.is_set():
+            latest = None
+            for item in ipc_mod.drain(self.ipc.telemetry_q, limit=8):
+                latest = item
+            if latest is not None:
+                with self._telemetry_lock:
+                    self._last_drive = latest.get('drive')
+                    self._last_servo = latest.get('servo') or {}
+                    self._last_signs = latest.get('signs') or self._last_signs
+                    self._last_control_ts = latest.get('ts', 0.0)
+            self._stop_evt.wait(1.0 / max(1.0, self.config.control.telemetry_hz))
+
     def get_telemetry(self):
         """Snapshot of everything a client may want to display."""
-        try:
-            battery = round(self.adc.recvADC(2) * 5, 2)
-        except Exception:
-            battery = 0.0
+        battery, light_l, light_r, adc_ts = self.ipc.read_adc()
+        with self._telemetry_lock:
+            drive = self._last_drive
+            servo = dict(self._last_servo)
+            signs = dict(self._last_signs)
+            control_ts = self._last_control_ts
+
+        if drive is None:
+            from drive_controller import DriveController
+            drive = DriveController._blank_telemetry()
+
+        # Age of the control data, so a UI can tell "stopped" from "not reporting".
+        # Without it a frozen snapshot looks exactly like a stationary kart.
+        drive = dict(drive)
+        drive['stale'] = (control_ts == 0.0 or
+                          (time.monotonic() - control_ts) >
+                          max(0.5, 5.0 / self.config.control.loop_hz))
+
         return {
-            "battery": battery,
+            "battery": round(battery, 2),
             "mode": self.Mode,
-            "drive": self.drive.telemetry(),
-            "signs": dict(self.encoders.sides.signs),
-            "servo": dict(self.servo.angles),
+            "drive": drive,
+            "signs": signs,
+            "servo": servo,
+            "light": {"left": light_l, "right": light_r},
+            "line": self.ipc.read_line(),
+            "processes": self.supervisor.status(),
         }
 
-    def _stop_rotation(self):
-        """Cooperatively stop the CMD_CAR_ROTATE spin thread, if running."""
-        try:
-            self.PWM.stop_rotate()
-        except Exception:
-            pass
-        self.rotation_flag = False
-        t = self._rotate_thread
-        if t is not None and t.is_alive():
-            t.join(timeout=1.0)
-        self._rotate_thread = None
+    def _legacy_sensor_publisher(self):
+        """Push the legacy ``CMD_MODE#...`` sensor lines to a TCP client.
+
+        Replaces three self-rearming ``threading.Timer`` chains (sendUltrasonic /
+        sendLight / sendLine), each of which created a BRAND NEW THREAD every
+        0.17-0.23 s for as long as its sensor was enabled. One thread reading
+        shared memory does the same job; the readings themselves now come from
+        P_sensors instead of this process touching I2C and GPIO.
+        """
+        period = 0.2
+        while not self._stop_evt.is_set():
+            if self.connection1 is not None:
+                if self.Light:
+                    _b, light_l, light_r, _ts = self.ipc.read_adc()
+                    self.send(f"CMD_MODE#1#{light_l}#{light_r}\n")
+                if self.sonic:
+                    distance, _guard, _healthy, _ts = self.ipc.read_distance()
+                    if distance is not None:
+                        self.send(f"{cmd.CMD_MODE}#3#{int(distance)}\n")
+                if self.Line:
+                    bits = self.ipc.read_line()
+                    if bits is not None:
+                        self.send(f"CMD_MODE#2#{bits[0]}{bits[1]}{bits[2]}\n")
+            self._stop_evt.wait(period)
+
+    def Power(self):
+        """Battery monitor: report the voltage and beep when it gets low.
+
+        Reads what P_sensors publishes instead of doing its own I2C, and asks
+        P_aux to sound the buzzer instead of owning the pin.
+        """
+        while not self._stop_evt.is_set():
+            battery, _l, _r, ts = self.ipc.read_adc()
+            if ts == 0.0:                      # no reading published yet
+                self._stop_evt.wait(1.0)
+                continue
+            try:
+                self.send(cmd.CMD_POWER + '#' + str(round(battery, 2)) + '\n')
+            except Exception:
+                pass
+            self._stop_evt.wait(3.0)
+
+            if battery < 10:
+                beeps = 4
+            elif battery < 10.5:
+                beeps = 2
+            else:
+                self._to_aux('buzzer', on='0')
+                continue
+            for _ in range(beeps):
+                self._to_aux('buzzer', on='1')
+                self._stop_evt.wait(0.1)
+                self._to_aux('buzzer', on='0')
+                self._stop_evt.wait(0.1)
 
     # ------------------------------------------------------------------
-    # Command handlers (registered in _build_router)
+    # Command handlers
     # ------------------------------------------------------------------
     def _h_mode(self, c: Command):
         mode = str(c.get('mode', c.arg(0)))
@@ -393,27 +476,18 @@ class Server:
         elif mode in ('two', '1'):
             self.stopMode()
             self.Mode = 'two'
-            self.lightRun = Thread(target=self.light.run, daemon=True)
-            self.lightRun.start()
+            self._to_aux('start_mode', mode='two')
             self.Light = True
-            self.lightTimer = threading.Timer(0.3, self.sendLight)
-            self.lightTimer.start()
         elif mode in ('three', '3'):
             self.stopMode()
             self.Mode = 'three'
-            self.ultrasonicRun = Thread(target=self.ultrasonic.run, daemon=True)
-            self.ultrasonicRun.start()
+            self._to_aux('start_mode', mode='three')
             self.sonic = False
-            self.ultrasonicTimer = threading.Timer(5, self.sendUltrasonic)
-            self.ultrasonicTimer.start()
         elif mode in ('four', '2'):
             self.stopMode()
             self.Mode = 'four'
-            self.infraredRun = Thread(target=self.infrared.run, daemon=True)
-            self.infraredRun.start()
+            self._to_aux('start_mode', mode='four')
             self.Line = True
-            self.lineTimer = threading.Timer(0.4, self.sendLine)
-            self.lineTimer.start()
 
     def _h_motor(self, c: Command):
         """Raw skid duty (bypasses PID). Legacy CMD_MOTOR / JSON {duty:[...]}."""
@@ -425,8 +499,7 @@ class Server:
                 d = [int(x) for x in duty[:4]]
             else:
                 d = [c.arg_int(i) for i in range(4)]
-            self.drive.release()          # stop PID fighting the raw duty
-            self.PWM.setMotorModel(*d)
+            self._to_control('motor', duty=d)
         except Exception:
             pass
 
@@ -434,91 +507,79 @@ class Server:
         """Closed-loop velocity command (m/s, rad/s) -> engages PID."""
         if self.Mode != 'one':
             return
-        v = c.num('linear', 0, 0.0)
-        w = c.num('angular', 1, 0.0)
-        self.drive.set_twist(v, w)
+        self._to_control('drive', linear=c.num('linear', 0, 0.0),
+                         angular=c.num('angular', 1, 0.0))
 
     def _h_drive_distance(self, c: Command):
         """Drive straight a set distance (m) and stop. Closed-loop on odometry."""
         if self.Mode != 'one':
             return
-        distance = c.num('distance', 0, 0.0)
-        speed = c.num('speed', 1, 0.2)
-        self.drive.drive_distance(distance, speed)
+        self._to_control('drive_distance', distance=c.num('distance', 0, 0.0),
+                         speed=c.num('speed', 1, 0.2))
 
     def _h_turn(self, c: Command):
         """Turn in place by a set angle (deg) and stop."""
         if self.Mode != 'one':
             return
-        angle = c.num('angle', 0, 0.0)
-        speed = c.num('speed', 1, 1.0)
-        self.drive.turn_in_place(angle, speed)
+        self._to_control('turn', angle=c.num('angle', 0, 0.0),
+                         speed=c.num('speed', 1, 1.0))
 
     def _h_goto(self, c: Command):
         """Go to world pose (x, y[, theta_deg]) -- turn, drive, turn."""
         if self.Mode != 'one':
             return
-        x = c.num('x', 0, 0.0)
-        y = c.num('y', 1, 0.0)
         theta = c.get('theta')
-        theta = float(theta) if theta is not None else None
-        self.drive.goto_pose(x, y, theta)
+        self._to_control('goto', x=c.num('x', 0, 0.0), y=c.num('y', 1, 0.0),
+                         theta=float(theta) if theta is not None else None)
 
     def _h_raw_turn_schedule(self, c: Command):
-        """Open-loop PWM turn run on the Pi (no per-step network latency); with
-        no gyro, it fakes the odometry heading each tick so telemetry reflects
-        the turn. `final_turn_angle` is a RELATIVE delta (deg): the heading ends
-        at start + final_turn_angle. JSON: turn_fn, ccw, pwm, min_pwm,
-        final_turn_angle, fn_params."""
+        """Open-loop PWM turn run on the Pi (no per-step network latency)."""
         if self.Mode != 'one':
             return
-        turn_fn = str(c.get('turn_fn', 'trapezoid'))
-        ccw     = bool(c.get('ccw', True))
-        pwm     = int(c.num('pwm', 0, 2000))
-        min_pwm = int(c.num('min_pwm', 1, 1000))
-        final   = c.num('final_turn_angle', 2, 90.0)
-        params  = c.get('fn_params')
-        if not isinstance(params, dict):
-            params = {}
-        self.drive.raw_turn_schedule(turn_fn, ccw, pwm, min_pwm, final, params)
+        params = c.get('fn_params')
+        self._to_control('raw_turn_schedule',
+                         turn_fn=str(c.get('turn_fn', 'trapezoid')),
+                         ccw=bool(c.get('ccw', True)),
+                         pwm=int(c.num('pwm', 0, 2000)),
+                         min_pwm=int(c.num('min_pwm', 1, 1000)),
+                         final_turn_angle=c.num('final_turn_angle', 2, 90.0),
+                         fn_params=params if isinstance(params, dict) else {})
 
     def _h_reset_odometry(self, c: Command):
-        self.drive.reset_odometry()
+        self._to_control('reset_odometry')
 
     def _h_calibrate_imu(self, c: Command):
-        """Re-estimate the gyro bias (kart must be still). Runs off-thread so the
-        command returns immediately."""
-        if self.gyro is None:
-            return
-        threading.Thread(target=self.gyro.calibrate, daemon=True,
-                         name="GyroCalibrate").start()
+        """Re-estimate the gyro bias (kart must be still).
+
+        Used to spawn a thread here to keep the command non-blocking. It is now
+        just a queue put: P_sensors owns the sensor and does the ~1.5 s of
+        sampling on its own loop.
+        """
+        self._to_sensors('calibrate_imu')
 
     def _h_set_sign(self, c: Command):
         """Flip encoder count sign(s) at runtime (calibration).
 
-        Mutates the live ``SideMapping.signs`` dict shared with the encoders,
-        so odometry picks up the change on the very next control tick.
-
         JSON forms:
           {"type":"set_sign","motor":"M3","sign":-1}
           {"type":"set_sign","signs":{"M1":1,"M2":1,"M3":-1,"M4":-1}}
+
+        The signs are applied in P_control (P_sensors publishes raw counts), so
+        this forwards rather than mutating a dict that the reader would never see.
         """
-        try:
-            signs = self.encoders.sides.signs
-            bulk = c.get('signs')
-            if isinstance(bulk, dict):
-                for tag, s in bulk.items():
-                    if tag in signs:
-                        signs[tag] = 1 if float(s) >= 0 else -1
-            else:
-                motor = str(c.get('motor', c.arg(0)))
-                if motor in signs:
-                    signs[motor] = 1 if c.num('sign', 1, 1) >= 0 else -1
-        except Exception:
-            pass
+        bulk = c.get('signs')
+        if isinstance(bulk, dict):
+            self._to_control('set_sign', signs=bulk)
+        else:
+            self._to_control('set_sign', motor=str(c.get('motor', c.arg(0))),
+                             sign=c.num('sign', 1, 1))
 
     def _h_mecanum(self, c: Command):
-        """Legacy mecanum joystick mix (CMD_M_MOTOR)."""
+        """Legacy mecanum joystick mix (CMD_M_MOTOR).
+
+        The mix is computed here, where the joystick geometry arrives, and the
+        result crosses the queue as four plain duties.
+        """
         if self.Mode != 'one':
             return
         try:
@@ -532,8 +593,7 @@ class Server:
             FL = LY + LX - RX
             BL = LY - LX - RX
             BR = LY + LX + RX
-            self.drive.release()
-            self.PWM.setMotorModel(FL, BL, FR, BR)
+            self._to_control('motor', duty=[FL, BL, FR, BR])
         except Exception:
             pass
 
@@ -551,149 +611,87 @@ class Server:
                 FL = LY + LX
                 BL = LY - LX
                 BR = LY + LX
-                self.drive.release()
-                self.PWM.setMotorModel(FL, BL, FR, BR)
+                self._to_control('motor', duty=[FL, BL, FR, BR])
             elif not self.rotation_flag:
-                self.angle = a2
-                self._stop_rotation()
-                self.drive.release()
                 self.rotation_flag = True
-                self._rotate_thread = Thread(target=self.PWM.Rotate,
-                                             args=(a2,), daemon=True)
-                self._rotate_thread.start()
+                self._to_control('car_rotate', angle=a2)
         except Exception:
             pass
 
     def _h_servo(self, c: Command):
+        """Servos share the PCA9685 with the motors, so P_control applies them."""
         try:
-            channel = str(c.get('channel', c.arg(0)))
-            angle = int(c.num('angle', 1, 90))
-            self.servo.setServoPwm(channel, angle)
+            self._to_control('servo', channel=str(c.get('channel', c.arg(0))),
+                             angle=int(c.num('angle', 1, 90)))
         except Exception:
             pass
 
     def _h_led(self, c: Command):
-        try:
-            index = int(c.num('index', 0, 255))
-            r = int(c.num('r', 1, 0))
-            g = int(c.num('g', 2, 0))
-            b = int(c.num('b', 3, 0))
-            self.led.ledIndex(index, r, g, b)
-        except Exception:
-            pass
+        self._to_aux('led', index=int(c.num('index', 0, 255)),
+                     r=int(c.num('r', 1, 0)), g=int(c.num('g', 2, 0)),
+                     b=int(c.num('b', 3, 0)))
 
     def _h_led_mode(self, c: Command):
         self.LedMoD = str(c.get('mode', c.arg(0)))
-        if self.LedMoD == '0':
-            self._stop_led_mode()
-        elif self.LedMoD == '1':
-            self._stop_led_mode()
-            self.led.ledMode(self.LedMoD)
-            time.sleep(0.1)
-            self.led.ledMode(self.LedMoD)
-        else:
-            self._stop_led_mode()
-            time.sleep(0.1)
-            self._led_mode = Thread(target=self.led.ledMode,
-                                    args=(self.LedMoD,), daemon=True)
-            self._led_mode.start()
-
-    def _stop_led_mode(self):
-        try:
-            stop_thread(self._led_mode)
-        except Exception:
-            pass
+        self._to_aux('led_mode', mode=self.LedMoD)
 
     def _h_sonic(self, c: Command):
         on = str(c.get('on', c.arg(0)))
-        if on in ('1', 'True', 'true'):
-            self.sonic = True
-            self.ultrasonicTimer = threading.Timer(0.5, self.sendUltrasonic)
-            self.ultrasonicTimer.start()
-        else:
-            self.sonic = False
+        self.sonic = on in ('1', 'True', 'true')
 
     def _h_buzzer(self, c: Command):
-        try:
-            on = c.get('on')
-            if on is None:
-                on = c.arg(0)
-            value = '1' if on in (True, '1', 'true', 'True') else '0'
-            self.buzzer.run(value)
-        except Exception:
-            pass
+        on = c.get('on')
+        if on is None:
+            on = c.arg(0)
+        self._to_aux('buzzer', on='1' if on in (True, '1', 'true', 'True') else '0')
 
     def _h_light(self, c: Command):
         on = str(c.get('on', c.arg(0)))
-        if on in ('1', 'True', 'true'):
-            self.Light = True
-            self.lightTimer = threading.Timer(0.3, self.sendLight)
-            self.lightTimer.start()
-        else:
-            self.Light = False
+        self.Light = on in ('1', 'True', 'true')
 
     def _h_power(self, c: Command):
+        battery, _l, _r, _ts = self.ipc.read_adc()
+        self.send(cmd.CMD_POWER + '#' + str(round(battery, 2)) + '\n')
+
+    # ------------------------------------------------------------------
+    # Shutdown
+    # ------------------------------------------------------------------
+    def shutdown(self):
+        """Stop everything, in the order that leaves the kart safe.
+
+        Replaces the old ``drive.shutdown() / stop_camera() / PWM.setMotorModel(0…)``
+        sequence that every entry point open-coded.
+        """
+        self._stop_evt.set()
+        self.tcp_Flag = False
         try:
-            ADC_Power = self.adc.recvADC(2) * 5
-            self.send(cmd.CMD_POWER + '#' + str(round(ADC_Power, 2)) + '\n')
+            self._to_control('stop')
+            self._to_aux('stop_mode')
         except Exception:
             pass
+        # Give the control loop a couple of ticks to actually apply that brake
+        # before the stop event ends its loop. Without the pause the graceful
+        # path is decorative: stop_evt would cut the loop before it ever drained
+        # the command, and only P_control's finally block (or, worse, the
+        # supervisor's emergency stop) would halt the motors.
+        time.sleep(3.0 / max(1.0, self.config.control.loop_hz))
+        self.StopTcpServer()
+        self.supervisor.shutdown()
 
-    def sendUltrasonic(self):
-        if self.sonic == True:
-            ADC_Ultrasonic = self.ultrasonic.get_distance()
-            try:
-                self.send(cmd.CMD_MODE + "#" + "3" + "#" + str(ADC_Ultrasonic) + '\n')
-            except:
-                self.sonic = False
-            self.ultrasonicTimer = threading.Timer(0.23, self.sendUltrasonic)
-            self.ultrasonicTimer.start()
-
-    def sendLight(self):
-        if self.Light == True:
-            ADC_Light1 = self.adc.recvADC(0)
-            ADC_Light2 = self.adc.recvADC(1)
-            try:
-                self.send("CMD_MODE#1" + '#' + str(ADC_Light1) + '#' + str(ADC_Light2) + '\n')
-            except:
-                self.Light = False
-            self.lightTimer = threading.Timer(0.17, self.sendLight)
-            self.lightTimer.start()
-
-    def sendLine(self):
-        if self.Line == True:
-            Line1 = 1 if GPIO.input(14) else 0
-            Line2 = 1 if GPIO.input(15) else 0
-            Line3 = 1 if GPIO.input(23) else 0
-            try:
-                self.send("CMD_MODE#2" + '#' + str(Line1) + str(Line2) + str(Line3) + '\n')
-            except:
-                self.Line = False
-            self.LineTimer = threading.Timer(0.20, self.sendLine)
-            self.LineTimer.start()
-
-    def Power(self):
-        while True:
-            ADC_Power = self.adc.recvADC(2) * 5
-            try:
-                self.send(cmd.CMD_POWER + '#' + str(round(ADC_Power, 2)) + '\n')
-            except:
-                pass
-            time.sleep(3)
-            if ADC_Power < 10:
-                for i in range(4):
-                    self.buzzer.run('1')
-                    time.sleep(0.1)
-                    self.buzzer.run('0')
-                    time.sleep(0.1)
-            elif ADC_Power < 10.5:
-                for i in range(2):
-                    self.buzzer.run('1')
-                    time.sleep(0.1)
-                    self.buzzer.run('0')
-                    time.sleep(0.1)
-            else:
-                self.buzzer.run('0')
 
 if __name__ == '__main__':
-    pass
+    # Smoke test: bring the stack up, print telemetry, shut it down.
+    srv = Server()
+    try:
+        while True:
+            time.sleep(1.0)
+            tel = srv.get_telemetry()
+            pose = tel['drive']['pose']
+            print(f"battery={tel['battery']}V mode={tel['mode']} "
+                  f"pose=({pose['x']:.3f},{pose['y']:.3f},{pose['theta_deg']:.1f}) "
+                  f"stale={tel['drive']['stale']} "
+                  f"procs={ {k: v['alive'] for k, v in tel['processes']['children'].items()} }")
+    except KeyboardInterrupt:
+        print('\nShutting down...')
+    finally:
+        srv.shutdown()

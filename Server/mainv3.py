@@ -1,143 +1,150 @@
-import io
-import os
-import socket
-import struct
-import time
-import picamera2
-import sys
-import signal
-import threading
+#!/usr/bin/python3
+"""
+Headless TCP entry point (legacy app on ports 5000/8000), as a systemd-style
+service with signal control.
+
+With the multiprocess split, ``Server()`` forks P_control / P_sensors / P_camera /
+P_aux and its own Supervisor watches them, so the job of this file shrank: it no
+longer needs its own restart-on-crash wrapper around three threads. What is left
+is the TCP transports (which are threads in P_web, because they are pure socket
+I/O) and the signal plumbing.
+
+One thing that MUST NOT come back here: ``os._exit`` or a hard kill before
+``Server.shutdown()``. The PCA9685 latches its last duty in hardware, so leaving
+the children orphaned leaves the kart driving.
+"""
 import logging
+import os
+import signal
+import sys
+import threading
+import time
+
 from server import Server
-import RPi.GPIO as GPIO
 
 # Configuration log
 logging.basicConfig(filename='/var/log/car_server.log', level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
-BUZZER_PIN = 17
 
 class ServerController:
     def __init__(self):
+        # Forks the child processes; must happen before any thread starts here.
         self.TCP_Server = Server()
         self.is_running = False
         self.threads = []
         self.stop_event = threading.Event()
 
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setup(BUZZER_PIN, GPIO.OUT)
-        GPIO.output(BUZZER_PIN, GPIO.LOW)
-
     def beep(self):
-
+        """Startup chirp, through P_aux (which owns the buzzer pin)."""
         try:
-            GPIO.output(BUZZER_PIN, GPIO.HIGH)
-            time.sleep(0.5)  # Buzzer sounds for 0.5s
-            GPIO.output(BUZZER_PIN, GPIO.LOW)
-            time.sleep(0.5)  # Buzzer stop 0.5s
+            self.TCP_Server._to_aux('buzzer', on='1')
+            time.sleep(0.5)
+            self.TCP_Server._to_aux('buzzer', on='0')
         except Exception as e:
             logging.error(f"Buzzer error: {e}")
 
     def start_server(self):
-        if not self.is_running:
-            logging.info("Starting server...")
-            self.TCP_Server.StartTcpServer()
-            self.threads = [
-                threading.Thread(target=self.run_thread, args=(self.TCP_Server.readdata, "ReadData")),
-                threading.Thread(target=self.run_thread, args=(self.TCP_Server.sendvideo, "SendVideo")),
-                threading.Thread(target=self.run_thread, args=(self.TCP_Server.Power, "Power"))
-            ]
-            for thread in self.threads:
-                thread.daemon = True
-                thread.start()
-            self.is_running = True
-            logging.info("Server started")
-
-            threading.Thread(target=self.beep, daemon=True).start()
-        else:
+        if self.is_running:
             logging.info("Server is already running")
+            return
 
-    def run_thread(self, target, name):
-        while not self.stop_event.is_set():
-            try:
-                target()
-            except Exception as e:
-                logging.error(f"Error in {name} thread: {e}")
-                break
+        logging.info("Starting server...")
+        self.TCP_Server.tcp_Flag = True
+        self.TCP_Server.StartTcpServer()
+        # These three are socket/queue I/O only -- no hardware, no busy loops --
+        # so they stay threads in this process. Each loop exits on its own when
+        # tcp_Flag drops and its socket closes, which is why the old
+        # restart-on-exception wrapper is gone: an exiting loop now means "we are
+        # shutting down", not "it crashed, restart it".
+        self.threads = [
+            threading.Thread(target=self.TCP_Server.readdata, name="ReadData",
+                             daemon=True),
+            threading.Thread(target=self.TCP_Server.sendvideo, name="SendVideo",
+                             daemon=True),
+            threading.Thread(target=self.TCP_Server.Power, name="Power",
+                             daemon=True),
+        ]
+        for thread in self.threads:
+            thread.start()
+        self.is_running = True
+        logging.info("Server started: %s", self.TCP_Server.supervisor.status())
+
+        threading.Thread(target=self.beep, daemon=True).start()
 
     def stop_server(self):
-        if self.is_running:
-            logging.info("Stopping server...")
-            self.stop_event.set()
-            self.TCP_Server.StopTcpServer()
-            for thread in self.threads:
-                thread.join(timeout=3) # Give each thread 3s to finish
-            self.is_running = False
-            logging.info("Server stopped")
-        else:
+        if not self.is_running:
             logging.info("Server is not running")
+            return
+        logging.info("Stopping server...")
+        self.TCP_Server.StopTcpServer()          # drops tcp_Flag, closes sockets
+        for thread in self.threads:
+            thread.join(timeout=3)
+        self.is_running = False
+        logging.info("Server stopped")
 
     def run(self):
-        self.start_server()  # Automatic opening of tcp server
+        self.start_server()
         try:
             while not self.stop_event.is_set():
                 time.sleep(1)
+                # The Supervisor logs and acts on a dead or wedged child itself
+                # (including braking the motors); surface it in the service log
+                # too, since that is what an operator reads after the fact.
+                degraded = self.TCP_Server.supervisor.degraded
+                if degraded:
+                    logging.error("degraded processes: %s", degraded)
         except KeyboardInterrupt:
             logging.info("Program interrupted by user")
         finally:
             self.stop_server()
 
-def cleanup():
+    def shutdown(self):
+        self.stop_event.set()
+        self.stop_server()
+        self.TCP_Server.shutdown()               # joins children, brakes motors
+
+
+def cleanup(controller):
     logging.info("Cleaning up resources...")
     try:
-        if hasattr(picamera2.Picamera2, 'global_cleanup'):
-            picamera2.Picamera2.global_cleanup()
-        else:
-            logging.warning("Picamera2 global_cleanup not available")
+        controller.shutdown()
+    except Exception as e:
+        logging.error(f"Error during shutdown: {e}")
+    try:
+        import RPi.GPIO as GPIO
         GPIO.cleanup()
     except Exception as e:
-        logging.error(f"Error during cleanup: {e}")
+        logging.error(f"Error during GPIO cleanup: {e}")
 
-def handle_stop(signum, frame):
-    logging.info("Stop signal received")
-    controller.stop_server()
-
-def handle_restart(signum, frame):
-    logging.info("Restart signal received")
-    controller.stop_server()
-    controller.start_server()
 
 if __name__ == '__main__':
     controller = ServerController()
-    
-    def shutdown(signum, frame):
-        logging.info("Shutdown signal received")
-        controller.stop_server()
-        cleanup()
-        sys.exit(0)
 
-    signal.signal(signal.SIGINT,  shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
-    signal.signal(signal.SIGUSR1, handle_stop)  # For stopping the server
-    signal.signal(signal.SIGUSR2, handle_restart)  # For restarting the server
+    def handle_stop(signum, frame):
+        logging.info("Stop signal received")
+        controller.stop_server()
+
+    def handle_restart(signum, frame):
+        logging.info("Restart signal received")
+        controller.stop_server()
+        controller.start_server()
+
+    def handle_shutdown(signum, frame):
+        logging.info("Shutdown signal received")
+        controller.stop_event.set()
+
+    # SIGINT/SIGTERM only SET the stop flag; the actual teardown runs in the main
+    # thread's finally block. Doing it inside the handler risked re-entering
+    # shutdown from a signal while the main thread was already in it.
+    signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    signal.signal(signal.SIGUSR1, handle_stop)      # stop the TCP transports
+    signal.signal(signal.SIGUSR2, handle_restart)   # restart them
 
     try:
         controller.run()
     finally:
-        cleanup()
-        
-        logging.info("Waiting for all threads to finish (10 seconds timeout)...")
-        timeout = time.time() + 10
-        while threading.active_count() > 1 and time.time() < timeout:
-            time.sleep(0.1)
-        
-        remaining_threads = threading.enumerate()
-        if len(remaining_threads) > 1:
-            logging.warning(f"Force quitting. {len(remaining_threads) - 1} threads did not finish in time:")
-            for thread in remaining_threads:
-                if thread != threading.current_thread():
-                    logging.warning(f"- {thread.name}")
-            os._exit(1)
-        else:
-            logging.info("All threads finished. Exiting normally.")
-            sys.exit(0)
+        cleanup(controller)
+        logging.info("Exiting")
+        sys.exit(0)

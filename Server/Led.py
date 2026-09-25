@@ -310,10 +310,13 @@ class Led:
         if hasattr(self, 'strip') and self.Ledsupported:
             self.strip.set_all_led_color(0, 0, 0)
 
-led = Led()
+# NOTE: no module-level ``led = Led()``. Importing this module used to open SPI0
+# and blank the strip as a side effect; only P_aux owns the LED strip now.
+# See Server/proc_aux.py.
 
 if __name__ == '__main__':
     print('Program is starting ... ')
+    led = Led()
     if led.Ledsupported == 1:
         try:
             while True:

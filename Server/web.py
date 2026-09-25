@@ -6,12 +6,17 @@ Serves a mobile-friendly control page over HTTP with:
   * a WebSocket for commands (JSON or legacy CMD_#text) and live telemetry,
   * MJPEG streaming for the camera feed.
 
-Telemetry (battery, odometry pose, wheel speeds, PID duties) is pushed to every
-connected WebSocket client at ControlConfig.telemetry_hz.
+This is the parent process (P_web) of the multiprocess stack: it forks the
+control, sensor, camera and aux processes (via Server -> Supervisor) and then
+does nothing but network I/O. Telemetry is pushed to every connected WebSocket
+client at ControlConfig.telemetry_hz -- now 20 Hz rather than 500, because the
+control loop only produces a new snapshot at loop_hz and re-serialising the same
+one 25 times over was costing a core the control loop needed.
 
 Usage:
     sudo python3 web.py              # Web only (port 8080)
     sudo python3 web.py --with-tcp   # Web + legacy TCP server (5000/8000/8080)
+    sudo python3 web.py --no-camera  # Skip the camera process
 """
 import asyncio
 import os
@@ -38,21 +43,16 @@ async def index_handler(request):
     return web.FileResponse(os.path.join(STATIC_DIR, 'index.html'))
 
 
-def _wait_for_frame(output):
-    """Blocking wait for the next camera frame (run in an executor)."""
-    with output.condition:
-        output.condition.wait(timeout=2.0)
-        return output.frame
-
-
 async def video_handler(request):
-    """MJPEG stream over HTTP multipart."""
-    srv = request.app['server']
-    srv.start_camera()
-    output = srv.streaming_output
+    """MJPEG stream over HTTP multipart.
 
-    if output is None:
-        return web.Response(status=503, text='Camera not available')
+    Frames come out of the shared ring that P_camera writes, so this handler no
+    longer shares a process with the JPEG encoder. The blocking ring read runs in
+    an executor thread; each client has its own cursor, so a slow viewer skips
+    frames rather than holding up the camera or the other viewers.
+    """
+    srv = request.app['server']
+    reader = srv.acquire_camera()
 
     response = web.StreamResponse()
     response.content_type = 'multipart/x-mixed-replace; boundary=frame'
@@ -61,20 +61,26 @@ async def video_handler(request):
     loop = asyncio.get_event_loop()
     try:
         while True:
-            frame = await loop.run_in_executor(None, _wait_for_frame, output)
+            frame = await loop.run_in_executor(None, reader.read, 2.0)
             if frame is None:
+                # Timed out: either the camera has not started yet or it stopped.
+                # Fall through so a disconnected client is noticed on the next
+                # write instead of blocking here forever.
+                if request.transport is None or request.transport.is_closing():
+                    break
                 continue
-            data = (
-                b'--frame\r\n'
-                b'Content-Type: image/jpeg\r\n'
-                b'Content-Length: ' + str(len(frame)).encode() + b'\r\n'
-                b'\r\n' + frame + b'\r\n'
-            )
-            await response.write(data)
+            # Written in parts rather than one concatenated buffer: the old code
+            # built `header + frame + trailer` per frame per viewer, copying the
+            # whole JPEG on the event-loop thread.
+            await response.write(
+                b'--frame\r\nContent-Type: image/jpeg\r\nContent-Length: '
+                + str(len(frame)).encode() + b'\r\n\r\n')
+            await response.write(frame)
+            await response.write(b'\r\n')
     except (ConnectionResetError, asyncio.CancelledError):
         pass
     finally:
-        srv.release_camera()
+        reader.close()
 
     return response
 
@@ -123,6 +129,17 @@ async def status_handler(request):
     return web.json_response({'mode': tel['mode'], 'battery': tel['battery']})
 
 
+async def health_handler(request):
+    """Per-process health: pids, liveness, control-loop heartbeat age.
+
+    New endpoint, and the thing to check first when the kart misbehaves: with the
+    stack split across processes, "the web UI is up" no longer implies the control
+    loop is running.
+    """
+    srv = request.app['server']
+    return web.json_response(srv.supervisor.status())
+
+
 # ---------------------------------------------------------------------------
 # Telemetry broadcast
 # ---------------------------------------------------------------------------
@@ -138,7 +155,9 @@ async def telemetry_broadcaster(app):
         tel = srv.get_telemetry()
         message = protocol.telemetry_message(
             battery=tel['battery'], mode=tel['mode'], drive=tel['drive'],
-            extra={'signs': tel.get('signs'), 'servo': tel.get('servo')})
+            extra={'signs': tel.get('signs'), 'servo': tel.get('servo'),
+                   'light': tel.get('light'), 'line': tel.get('line'),
+                   'processes': tel.get('processes')})
         for ws in list(clients):
             if ws.closed:
                 clients.discard(ws)
@@ -174,6 +193,7 @@ def create_app(server_instance):
     app.router.add_get('/video', video_handler)
     app.router.add_get('/ws', websocket_handler)
     app.router.add_get('/status', status_handler)
+    app.router.add_get('/health', health_handler)
     app.router.add_post('/command', command_handler)
     app.on_startup.append(_start_background)
     app.on_cleanup.append(_stop_background)
@@ -188,7 +208,14 @@ def run_web(server_instance, port=WEB_PORT):
 
 
 if __name__ == '__main__':
-    srv = Server()
+    # Server() forks the child processes. It must therefore run before anything
+    # here starts a thread or an event loop -- see Server.__init__ and
+    # supervisor.assert_fork_safe.
+    srv = Server(with_camera='--no-camera' not in sys.argv)
+
+    # The parent keeps off the core reserved for the control loop.
+    import ipc as ipc_mod
+    ipc_mod.apply_process_tuning("web", cpu=CONFIG.process.web_cpus)
 
     if '--with-tcp' in sys.argv:
         srv.StartTcpServer()
@@ -200,9 +227,7 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         print('\nShutting down...')
     finally:
-        try:
-            srv.drive.shutdown()
-        except Exception:
-            pass
-        srv.stop_camera()
-        srv.PWM.setMotorModel(0, 0, 0, 0)
+        # One call now: it releases the camera, stops the control loop (which
+        # brakes the motors), joins every child and stops the motors again as a
+        # backstop if any of that failed.
+        srv.shutdown()

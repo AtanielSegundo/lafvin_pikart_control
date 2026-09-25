@@ -170,6 +170,12 @@ ENCODER_PINS: Dict[str, Tuple[int, int]] = {
     "M4": (8, 7),     # upper-right (rewired to Pi GPIO SPI0 pins; needs SPI off)
 }
 
+# Fixed slot order for the encoder counts in shared memory (Server/ipc.py).
+# Spelled out rather than derived from ENCODER_PINS' insertion order, because
+# two processes have to agree on this layout and a reordered dict literal would
+# silently swap motors between sides.
+ENCODER_TAGS: Tuple[str, ...] = ("M1", "M2", "M3", "M4")
+
 # ---------------------------------------------------------------------------
 # Single-phase (degraded) encoders.
 #
@@ -222,14 +228,14 @@ MOTOR_CHANNELS = {
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class ControlConfig:
-    loop_hz: float = 20.0             # closed-loop update rate
-    telemetry_hz: float = 500.0       # rate telemetry is pushed to clients
-    command_timeout: float = 0.1      # s; stop motors if no drive cmd arrives
-    minimum_front_distance_cm: int = 10   # front guard trips below this (cm)
-    front_distance_ttl_s: float = 0.5     # drop the REPORTED distance after
-                                          # this long with no valid reading
-    max_linear: float = 0.6           # m/s, saturates drive commands
-    max_angular: float = 4.0          # rad/s
+    loop_hz                  : float = 20.0
+    telemetry_hz             : float = 10.0
+    command_timeout          : float = 0.1   # s; stop motors if no drive cmd arrives
+    minimum_front_distance_cm: int   = 10    # front guard trips below this (cm)
+    front_distance_ttl_s     : float = 0.5   # drop the REPORTED distance after
+                              # this long with no valid reading
+    max_linear : float = 0.6  # m/s, saturates drive commands
+    max_angular: float = 4.0  # rad/s
 
 
 @dataclass(frozen=True)
@@ -238,6 +244,63 @@ class NetworkConfig:
     tcp_command_port: int = 5000
     tcp_video_port: int = 8000
     interface: str = "wlan0"
+
+
+# ---------------------------------------------------------------------------
+# Multiprocess layout (Raspberry Pi 3B+: 4x Cortex-A53 @ 1.4 GHz, 1 GB RAM).
+#
+# The subsystems run as four OS processes so the 20 Hz control loop gets its own
+# GIL and its own core instead of competing with ~24k/s pigpio encoder callbacks
+# and the aiohttp/WebSocket loop:
+#
+#   P_web      (parent)  aiohttp, WebSocket, HTTP, TCP legacy, supervision
+#   P_control            DriveController.step() + Motor + Servo (SOLE PWM owner)
+#   P_sensors            encoders (pigpio), MPU6050, ultrasonic, ADC, IR line
+#   P_camera             Picamera2 + JPEG encode -> shared frame ring
+#   P_aux                LED animations, buzzer, legacy autonomous modes
+#
+# The control loop's arithmetic is NOT cpu-bound (microseconds per tick); what
+# it needs is determinism, which is why control_cpu / control_rt_priority exist.
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ProcessConfig:
+    # CPU pinning. `None` disables pinning for that process. P_control gets a
+    # core to itself; P_web (the parent) is pushed off it.
+    control_cpu: int | None = 3
+    sensors_cpu: int | None = 2
+    web_cpus: Tuple[int, ...] = (0, 1)
+
+    # Scheduling. SCHED_FIFO needs root (the project already runs under sudo for
+    # pigpio/SPI); each step degrades gracefully to the next.
+    control_rt_priority: int = 20     # 0 disables SCHED_FIFO, falls back to nice
+    control_nice: int = -10
+    sensors_nice: int = -5
+    aux_nice: int = 10                # animations must never preempt control
+
+    # Publication rates inside P_sensors.
+    sensor_publish_hz: float = 100.0  # encoder totals + gyro + guard -> shm
+    adc_poll_hz: float = 5.0          # battery / photoresistors (slow I2C)
+    line_poll_hz: float = 20.0        # IR line sensors (GPIO)
+
+    # Staleness limits. Across processes "the object exists" no longer proves
+    # the data is fresh: a wedged or killed producer would otherwise publish its
+    # last value forever and the control loop would close its heading PID on a
+    # frozen yaw. Every shm consumer checks these.
+    gyro_stale_s: float = 0.25
+    guard_stale_s: float = 0.50
+    control_heartbeat_s: float = 1.0  # watchdog: stale beyond this -> escalate
+    control_kill_after_s: float = 2.0 # ...and beyond this -> terminate + stop
+
+    # Camera frame ring (shared memory, no pickling). 3 slots at 20 fps gives a
+    # reader ~150 ms to copy a frame out before its slot is reused.
+    frame_slots: int = 3
+    frame_slot_bytes: int = 320 * 1024
+
+    # Bounded queues. Producers use put_nowait + drop-oldest, so a stalled
+    # consumer can never block the web loop or the control loop.
+    command_queue_size: int = 64
+    telemetry_queue_size: int = 4
+    event_queue_size: int = 256
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +315,7 @@ class RobotConfig:
     sides   : SideMapping   = field(default_factory=SideMapping)
     control : ControlConfig = field(default_factory=ControlConfig)
     network : NetworkConfig = field(default_factory=NetworkConfig)
+    process : ProcessConfig = field(default_factory=ProcessConfig)
 
 
 CONFIG = RobotConfig()

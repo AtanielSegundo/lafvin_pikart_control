@@ -55,10 +55,22 @@ class Ultrasonic:
     
     
     
-    def run(self):
-        self.PWM = Motor()
-        self.pwm_S = Servo()
-        while True:
+    def run(self, motor=None, servo=None, stop_evt=None):
+        """Legacy obstacle-avoidance mode.
+
+        ``motor`` / ``servo`` are injected because this loop no longer runs in
+        the process that owns the PCA9685: in P_aux it is handed a RemoteMotor
+        that forwards duties to P_control over the command queue (see
+        Server/ipc.py). Constructing Motor()/Servo() here would open a SECOND
+        PCA9685 client on the same chip from a second process.
+
+        ``stop_evt`` replaces the old ctypes ``stop_thread()`` kill: the loop now
+        exits cooperatively instead of taking an injected SystemExit somewhere
+        mid-I2C-transaction.
+        """
+        self.PWM = motor if motor is not None else Motor()
+        self.pwm_S = servo
+        while stop_evt is None or not stop_evt.is_set():
             M = self.get_distance()
             if M <= 20:
                 self.PWM.setMotorModel(-1000, -1000, -1000, -1000)
@@ -77,16 +89,20 @@ class Ultrasonic:
                 else:
                     self.PWM.setMotorModel(2000, 2000, -2000, -2000)
                 time.sleep(0.3)
-            else:  
+            else:
                 self.PWM.setMotorModel(1000, 1000, 1000, 1000)
+        self.PWM.setMotorModel(0, 0, 0, 0)
 
 
-ultrasonic = Ultrasonic()
+# No module-level ``ultrasonic = Ultrasonic()``: that ran GPIO.setmode/setup on
+# import, in every process that imported this module.
 
 if __name__ == '__main__':
     print('Program is starting ... ')
+    ultrasonic = Ultrasonic()
     try:
-        ultrasonic.run()
+        ultrasonic.run(motor=Motor(), servo=Servo())
     except KeyboardInterrupt:  # When 'Ctrl+C' is pressed, the child program destroy() will be  executed.
-        PWM.setMotorModel(0, 0, 0, 0)
-        ultrasonic.pwm_S.setServoPwm('0', 90)
+        Motor().setMotorModel(0, 0, 0, 0)
+        if ultrasonic.pwm_S is not None:
+            ultrasonic.pwm_S.setServoPwm('0', 90)

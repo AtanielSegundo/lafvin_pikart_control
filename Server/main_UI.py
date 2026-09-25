@@ -5,7 +5,6 @@ import struct
 import time
 import picamera2
 import sys, getopt
-from Thread import *
 from threading import Thread
 from server import Server
 from server_ui import Ui_server_ui
@@ -53,9 +52,12 @@ class MyWindow(QMainWindow, Ui_server_ui):
 
     def start_server(self):
         self.TCP_Server.StartTcpServer()
-        self.ReadData = Thread(target=self.TCP_Server.readdata)
-        self.SendVideo = Thread(target=self.TCP_Server.sendvideo)
-        self.power = Thread(target=self.TCP_Server.Power)
+        # Daemon threads: they exit with the process, and the loops they run
+        # now watch TCP_Server.tcp_Flag / _stop_evt instead of being killed with
+        # the old ctypes stop_thread() injection.
+        self.ReadData = Thread(target=self.TCP_Server.readdata, daemon=True)
+        self.SendVideo = Thread(target=self.TCP_Server.sendvideo, daemon=True)
+        self.power = Thread(target=self.TCP_Server.Power, daemon=True)
         self.SendVideo.start()
         self.ReadData.start()
         self.power.start()
@@ -64,12 +66,9 @@ class MyWindow(QMainWindow, Ui_server_ui):
             self.Button_Server.setText("Stop Server")
 
     def stop_server(self):
-        try:
-            stop_thread(self.SendVideo)
-            stop_thread(self.ReadData)
-            stop_thread(self.power)
-        except:
-            pass
+        # Closing the listening sockets is what breaks the accept() loops out;
+        # tcp_Flag stops them re-entering. No thread killing needed.
+        self.TCP_Server.tcp_Flag = False
         try:
             self.TCP_Server.server_socket.shutdown(2)
             self.TCP_Server.server_socket1.shutdown(2)
@@ -89,6 +88,14 @@ class MyWindow(QMainWindow, Ui_server_ui):
 
     def close(self):
         self.stop_server()
+        # os._exit() skips every finally block, which with the process split
+        # would orphan the children -- and the PCA9685 latches its last duty in
+        # hardware, so an orphaned control process keeps the kart driving.
+        # shutdown() joins the children and brakes the motors first.
+        try:
+            self.TCP_Server.shutdown()
+        except Exception as exc:
+            print(f"shutdown error: {exc}")
         if self.user_ui:
             QCoreApplication.instance().quit()
         os._exit(0)
@@ -115,8 +122,11 @@ if __name__ == '__main__':
             sys.exit(myshow.app.exec_())
         else:
             try:
+                # Was `while True: pass` -- a bare busy-wait pinning a core,
+                # which is exactly the sort of load the control loop now has its
+                # own core to be safe from. Sleep instead.
                 while True:
-                    pass
+                    time.sleep(1.0)
             except KeyboardInterrupt:
                 myshow.close()
     except KeyboardInterrupt:

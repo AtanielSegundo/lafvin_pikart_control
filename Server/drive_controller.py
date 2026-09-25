@@ -19,10 +19,18 @@ Two engagement states:
     the motors, leaving raw ``CMD_MOTOR`` duty commands in control.
   * engaged: a velocity command took over; PID actively drives the motors.
 
-When a distance sensor is injected, a front collision guard runs in its own
-thread (:meth:`_dist_guard`): it holds ``dist_guard_lock`` whenever an obstacle
-is both closer than ``minimum_front_distance_cm`` and closing, and ``step``
-then vetoes net-forward motor drive (reverse / turn-in-place stay allowed).
+The front collision guard is injected (``guard``) rather than run here. It used
+to be a thread in this class that polled the ultrasonic sensor and signalled by
+*holding a mutex*, which ``step`` read back via ``dist_guard_lock.locked()``.
+That idiom does not survive a process boundary, and the sensor now lives in
+P_sensors anyway, so what crosses the boundary is one already-decided flag plus
+the hysteresis that produced it. ``step`` still vetoes net-forward drive only, so
+reverse and turn-in-place remain available to escape.
+
+Process model: this class is the body of P_control (see Server/proc_control.py).
+:meth:`step` is deliberately a pure function of its inputs and its own state --
+no queues, no shared memory -- which is what keeps it unit-testable against a
+simulated plant. Everything process-shaped lives in :meth:`run_loop`'s hooks.
 """
 from __future__ import annotations
 
@@ -37,14 +45,10 @@ from kinematics import SkidSteerKinematics, Twist, WheelSpeeds
 from odometry import Pose, SkidSteerOdometry, wrap_angle
 from pid import PID
 
-from collections import deque
-
 if TYPE_CHECKING:
-    # Import for type hints only: Ultrasonic pulls in RPi.GPIO and GyroMPU pulls
-    # in mpu6050, both absent off-Pi. `from __future__ import annotations` keeps
-    # the annotations lazy, so the controller still imports (unit-tests run) on
-    # a laptop/CI.
-    from Ultrasonic import Ultrasonic
+    # Import for type hints only: GyroMPU pulls in mpu6050, absent off-Pi.
+    # `from __future__ import annotations` keeps the annotations lazy, so the
+    # controller still imports (unit-tests run) on a laptop/CI.
     from heading import GyroMPU
 
 def _clamp(value: float, limit: float) -> float:
@@ -134,7 +138,7 @@ def _turn_profile_steps(turn_fn: str, pwm: int, min_pwm: int,
 class DriveController:
     def __init__(self, motor, encoders, config: RobotConfig = CONFIG,
                  clock: Callable[[], float] = time.monotonic,
-                 dist_sensor:Ultrasonic = None,
+                 guard=None,
                  gyro: "Optional[GyroMPU]" = None,
                  plant: "Optional[SimulatedDrivePlant]" = None):
         self.motor       = motor
@@ -142,7 +146,10 @@ class DriveController:
         self.config      = config
         self._clock      = clock
         self.plant       = plant
-        self.dist_sensor = dist_sensor
+        # Front collision guard: anything exposing ``engaged() -> bool`` and a
+        # ``distance_cm`` property. In P_control that is ipc.SharedFrontGuard,
+        # fed by P_sensors; None (tests, sim) means never engaged.
+        self.guard       = guard
         self.gyro        = gyro          # MPU6050 heading source (may be None)
 
         self.kin  = SkidSteerKinematics(config.wheel)
@@ -188,27 +195,39 @@ class DriveController:
 
         self._thread      : Optional[threading.Thread] = None
         self._stop_evt = threading.Event()
-        
-        self.dist_arr = deque(maxlen=3)     # recent VALID readings (min = closest)
-        self.front_distance_cm = None       # latest valid front distance, for UI
-        self._front_distance_ts = 0.0       # when that reading landed (expiry)
-        self._dist_thread: Optional[threading.Thread] = None
-        self._dist_stop_evt = threading.Event()
-        self.dist_guard_lock = threading.Lock()
 
         self._telemetry = self._blank_telemetry()
 
     # -- command API -------------------------------------------------------
-    def _apply_target(self, linear: float, angular: float) -> None:
-        """Set the engaged target twist (clamped). Does NOT touch any goal."""
+    def _apply_target(self, linear: float, angular: float,
+                      issued_at: float = None) -> None:
+        """Set the engaged target twist (clamped). Does NOT touch any goal.
+
+        ``issued_at`` is when the operator's command was RECEIVED (P_web stamps it
+        on ingress), on the same monotonic clock. It matters because
+        ``command_timeout`` is a dead-man switch: it should measure how long since
+        we last heard from the client, not how long since the control loop got
+        round to applying it. With the process split those differ by the queue
+        hop, and stamping at apply time would quietly extend the dead-man window
+        by however long the command sat in the queue.
+        """
         c = self.config.control
+        now = self._clock()
+        if issued_at is not None:
+            # Only credit a plausible latency. Both sides read CLOCK_MONOTONIC,
+            # which is system-wide on Linux, so this should always hold -- but a
+            # nonsensical timestamp must not permanently wedge teleop by making
+            # every command instantly stale, so fall back to now.
+            if 0.0 <= (now - issued_at) <= 5.0 * c.command_timeout:
+                now = issued_at
         with self._lock:
             self._target = Twist(_clamp(linear, c.max_linear),
                                  _clamp(angular, c.max_angular))
-            self._target_time = self._clock()
+            self._target_time = now
             self._engaged = True
 
-    def set_twist(self, linear: float, angular: float) -> None:
+    def set_twist(self, linear: float, angular: float,
+                  issued_at: float = None) -> None:
         """Command a body velocity (m/s, rad/s). Cancels any active move and
         engages velocity control. While the front guard is engaged, forward
         velocity is refused up front (reverse / turning stay allowed)."""
@@ -218,7 +237,7 @@ class DriveController:
             self._move = None
             self._heading_target = None       # teleop overrides a heading turn
             self._goto = None                 # ...and cancels a go-to-pose job
-        self._apply_target(linear, angular)
+        self._apply_target(linear, angular, issued_at)
 
     def set_wheel_speeds(self, left: float, right: float) -> None:
         """Command per-side wheel speeds (m/s). Engages closed-loop control."""
@@ -519,11 +538,18 @@ class DriveController:
 
     def _front_guard_engaged(self) -> bool:
         """The front distance guard is holding: an obstacle is closer than
-        `minimum_front_distance_cm` (the `_dist_guard` thread holds
-        `dist_guard_lock`). With no distance sensor injected it is never engaged
-        (unit tests / sim).
+        `minimum_front_distance_cm`. Decided by whoever owns the distance sensor
+        (P_sensors) and read here as one flag. With no guard injected it is never
+        engaged (unit tests / sim).
         """
-        return self.dist_sensor is not None and self.dist_guard_lock.locked()
+        return self.guard is not None and self.guard.engaged()
+
+    @property
+    def front_distance_cm(self):
+        """Latest valid front distance in cm, or None. Read-only view of the
+        guard, kept as an attribute because telemetry and the web UI already
+        consume this name."""
+        return None if self.guard is None else self.guard.distance_cm
 
     def _front_blocked(self, duty_left: float, duty_right: float) -> bool:
         """Guard engaged AND the command is net-forward (driving INTO the
@@ -739,97 +765,104 @@ class DriveController:
         
         return snapshot
 
-    def _run(self) -> None:
+    def run_loop(self, command_pump=None, telemetry_sink=None,
+                 heartbeat=None) -> None:
+        """Run the control loop in the CALLING thread until :meth:`shutdown`.
+
+        P_control calls this on its main thread, so the SCHED_FIFO priority it
+        set applies to the loop itself rather than to an idle parent thread.
+        :meth:`start` still wraps it in a thread for single-process use (tests,
+        scripts, the simulator).
+
+        The three hooks are the entire process-facing surface of this class:
+
+        ``command_pump``    called once per tick, before stepping, to apply
+                            whatever arrived on the command queue. Draining
+                            commands here (rather than from another thread)
+                            means a command can never land halfway through a
+                            step and leave the loop reading a target that was
+                            replaced mid-computation.
+        ``telemetry_sink``  called with each snapshot, to publish it upstream.
+        ``heartbeat``       called with the measured dt, for the supervisor's
+                            watchdog. A loop that stops beating while the
+                            PCA9685 still latches its last duty is the failure
+                            this exists to catch.
+        """
         period = 1.0 / self.config.control.loop_hz
         last = self._clock()
-        
+
         while not self._stop_evt.is_set():
             now = self._clock()
             dt = now - last
             last = now
-    
+
+            if command_pump is not None:
+                try:
+                    command_pump()
+                except Exception as exc:                        # noqa: BLE001
+                    print(f"[DriveController] command error: {exc}")
+
             try:
-                self.step(dt if dt > 0 else period)
-            except Exception as exc:
+                snapshot = self.step(dt if dt > 0 else period)
+            except Exception as exc:                            # noqa: BLE001
                 print(f"[DriveController] step error: {exc}")
-            
+                snapshot = None
+
+            if heartbeat is not None:
+                # Beat even on a failed step: the process is alive and still
+                # owns the motors, which is what the watchdog needs to know.
+                try:
+                    heartbeat(dt)
+                except Exception:                               # noqa: BLE001
+                    pass
+
+            if snapshot is not None and telemetry_sink is not None:
+                try:
+                    telemetry_sink(snapshot)
+                except Exception:                               # noqa: BLE001
+                    pass
+
             sleep = period - (self._clock() - now)
-            
+
             if sleep > 0:
                 self._stop_evt.wait(sleep)
 
-    # This thread guards the physical front of the Kart: it holds
-    # dist_guard_lock while an obstacle is closer than the limit, and step()
-    # reads that state (via _front_blocked) to veto forward motion.
-    def _dist_guard(self) -> None:
-        period = 1.0 / (2 * self.config.control.loop_hz)
-        limit = self.config.control.minimum_front_distance_cm
-        hysteresis = 5          # cm release margin, so jitter doesn't chatter
+    # Backwards-compatible alias (was the thread target).
+    _run = run_loop
 
-        while not self._dist_stop_evt.is_set():
-            now = self._clock()
+    # NOTE: the old ``_dist_guard`` thread lived here. It now runs in P_sensors
+    # (Server/proc_sensors.py) next to the sensor it polls, including the
+    # hysteresis and the reported-distance TTL, and publishes a single decided
+    # flag. See Server/ipc.py:SharedFrontGuard.
 
-            raw = self.dist_sensor.get_distance()
-            # Validity is sensor-agnostic: the pigpio reader returns real cm
-            # (incl. a large far/clear value), while the RPi.GPIO fallback uses
-            # 255 as its "failed read" sentinel -- drop that (and None), keep the
-            # rest. No extra smoothing here, so a fresh reading acts immediately.
-            if raw is not None and raw > 0 and raw != 255:
-                self.dist_arr.append(raw)
-                self.front_distance_cm = raw          # latest valid, for the UI
-                self._front_distance_ts = now
-            elif (self.front_distance_cm is not None and
-                  (now - self._front_distance_ts) >
-                      self.config.control.front_distance_ttl_s):
-                # Nothing valid for a while -> stop REPORTING a reading that is
-                # no longer true. Without this the last good value sticks
-                # forever: the RPi.GPIO sensor answers "out of range" with its
-                # 255 sentinel, which is dropped just above, so a clear road
-                # never refreshes the field and clients keep seeing the last
-                # close reading. (The pigpio reader doesn't have the problem --
-                # it reports max range for far/clear -- but the fallback does.)
-                # None is already the "unknown" value here and downstream: the
-                # web UI renders it as "-- cm".
-                # NOTE: only the reported value expires. dist_arr and the
-                # collision guard are deliberately left alone -- see the note
-                # to the operator; changing guard behaviour is a separate call.
-                self.front_distance_cm = None
-
-            if self.dist_arr:
-                f = min(self.dist_arr)
-                if f < limit and not self.dist_guard_lock.locked():
-                    self.dist_guard_lock.acquire()
-                elif f > limit + hysteresis and self.dist_guard_lock.locked():
-                    self.dist_guard_lock.release()
-
-            sleep = period - (self._clock() - now)
-
-            if sleep > 0:
-                self._dist_stop_evt.wait(sleep)
-
-    
     def start(self) -> None:
+        """Run the loop in a background thread (single-process use).
+
+        P_control does NOT use this -- it calls :meth:`run_loop` directly on its
+        main thread so its real-time priority applies to the loop.
+        """
         if self._thread and self._thread.is_alive():
             return
         self.encoders.begin()
 
         self._stop_evt.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True, name="DriveController")
+        self._thread = threading.Thread(target=self.run_loop, daemon=True,
+                                        name="DriveController")
         self._thread.start()
 
-        # Front collision guard only runs if a distance sensor was injected.
-        if self.dist_sensor is not None:
-            self._dist_stop_evt.clear()
-            self._dist_thread = threading.Thread(target=self._dist_guard, daemon=True, name="DistGuard")
-            self._dist_thread.start()
+    def stop_loop(self) -> None:
+        """Ask :meth:`run_loop` to return after the current tick.
+
+        P_control bridges the cross-process stop event into this, so the loop
+        always finishes a whole tick (and its motor write) rather than being torn
+        down mid-step.
+        """
+        self._stop_evt.set()
 
     def shutdown(self) -> None:
         self._stop_evt.set()
-        self._dist_stop_evt.set()
         if self._thread:
             self._thread.join(timeout=1.0)
-        if self._dist_thread:
-            self._dist_thread.join(timeout=1.0)
         try:
             self.motor.setMotorModel(0, 0, 0, 0)
         except Exception:
@@ -844,7 +877,13 @@ class DriveController:
     def reset_odometry(self, pose: Pose | None = None) -> None:
         self.odom.reset(pose)
 
-    def _blank_telemetry(self) -> dict:
+    @staticmethod
+    def _blank_telemetry() -> dict:
+        """The shape of a telemetry snapshot, with everything at rest.
+
+        Static so P_web can render a UI before the control process has published
+        its first tick, without inventing an instance to call it on.
+        """
         return {
             "pose": Pose().as_dict(),
             "twist": {"linear": 0.0, "angular": 0.0},

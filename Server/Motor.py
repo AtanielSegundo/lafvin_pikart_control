@@ -131,10 +131,19 @@ class Motor:
         self.setMotorModel(0, 0, 0, 0)
 
 
-PWM = Motor()
+# NOTE: there is deliberately NO module-level ``PWM = Motor()`` here any more.
+# Importing this module used to open the PCA9685 over I2C and write setPWMFreq(50)
+# as a side effect, which made the module unimportable from any process that is
+# not the PWM owner -- and with multiprocessing, `import Motor` happens in
+# P_sensors and P_aux too (via Light / Line_Tracking / Ultrasonic).
+#
+# Exactly ONE process (P_control) may construct Motor(). The singleton in this
+# class is per-process and does NOT protect against two processes driving the
+# same chip; see Server/proc_control.py.
 
 
 def loop():
+    PWM = Motor()
     PWM.setMotorModel(2000, 2000, 2000, 2000)  # Forward
     time.sleep(3)
     PWM.setMotorModel(-2000, -2000, -2000, -2000)  # Back
@@ -147,7 +156,7 @@ def loop():
 
 
 def destroy():
-    PWM.setMotorModel(0, 0, 0, 0)
+    Motor().setMotorModel(0, 0, 0, 0)
 
 
 if __name__ == '__main__':

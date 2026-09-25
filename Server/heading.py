@@ -92,6 +92,13 @@ class GyroMPU:
         self.angles = {"x": 0.0, "y": 0.0, "z": 0.0}
         self.gyro_bias = {"x": 0.0, "y": 0.0, "z": 0.0}
         self.heading = 0.0
+        # When _integrate last ran, on the monotonic clock. `connected` alone
+        # cannot tell a live sensor from a thread wedged inside an I2C read --
+        # it stays True in both cases -- and a consumer in ANOTHER process
+        # (P_control's heading PID) has no other way to notice. CLOCK_MONOTONIC
+        # is system-wide on Linux, so this timestamp is comparable across
+        # processes. 0.0 means "no sample yet".
+        self.last_sample_ts = 0.0
 
         self._lock     = threading.Lock()   # guards angles / bias / heading
         self._io_lock  = threading.Lock()   # serialises I2C access to the port
@@ -335,6 +342,7 @@ class GyroMPU:
             self.angles["y"] = gy
             self.angles["z"] = gz           # yaw: pure (bias-corrected) gyro
             self.heading = gz
+            self.last_sample_ts = time.monotonic()
         self.connected = True
 
     # ------------------------------------------------------------------ #
@@ -352,6 +360,18 @@ class GyroMPU:
         get_angles_gyro()['z'] so a mounting flip is fixed in one place."""
         with self._lock:
             return self.yaw_sign * self.angles[self.yaw_axis]
+
+    def sample(self):
+        """(yaw_deg, connected, last_sample_ts) read under one lock.
+
+        P_sensors publishes this tuple to shared memory. Taking it atomically
+        matters: reading the yaw and its timestamp in two separate lock
+        acquisitions can pair a fresh angle with a stale timestamp (or worse, the
+        reverse -- a stale angle stamped as fresh, which is precisely the
+        condition the staleness check exists to catch)."""
+        with self._lock:
+            return (self.yaw_sign * self.angles[self.yaw_axis],
+                    self.connected, self.last_sample_ts)
 
     def reset(self):
         """Zero the angles; re-seed roll/pitch from gravity if available."""

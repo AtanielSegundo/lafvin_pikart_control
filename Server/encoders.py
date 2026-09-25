@@ -284,27 +284,13 @@ class WheelEncoders:
 
     # -- aggregation -------------------------------------------------------
     def _resolve(self, tag: str, raw: Dict[str, float]) -> float:
-        """Turn a raw per-motor count into a sign/scale-corrected count.
-
-        Normal motors: raw * sign. Single-phase motors: unsigned magnitude,
-        scaled to the x4 tick base, with direction borrowed from the healthy
-        same-side partner (a lone phase can't sense rotation direction).
-        """
-        mode = self.modes.get(tag)
-        if mode:
-            partner = mode.get("direction_from")
-            scale = mode.get("scale", 1.0)
-            partner_signed = raw.get(partner, 0) * self.sides.signs.get(partner, 1)
-            direction = 1 if partner_signed >= 0 else -1
-            return abs(raw[tag]) * scale * direction
-        return raw[tag] * self.sides.signs.get(tag, 1)
+        """Turn a raw per-motor count into a sign/scale-corrected count."""
+        return resolve_count(tag, raw, self.sides.signs, self.modes)
 
     def side_counts(self) -> Tuple[float, float]:
         """Current sign-corrected mean count for (left, right)."""
         counts = {tag: enc.count for tag, enc in self.encoders.items()}
-        left = _mean(self._resolve(t, counts) for t in self.sides.left)
-        right = _mean(self._resolve(t, counts) for t in self.sides.right)
-        return left, right
+        return side_means(counts, self.sides, self.modes)
 
     def read_reset_sides(self) -> Tuple[float, float]:
         """Return (left, right) mean count deltas since the last call and
@@ -326,8 +312,7 @@ class WheelEncoders:
         use for it and keeps calling read_reset_sides.
         """
         raw = {tag: enc.read_reset() for tag, enc in self.encoders.items()}
-        left = _mean(self._resolve(t, raw) for t in self.sides.left)
-        right = _mean(self._resolve(t, raw) for t in self.sides.right)
+        left, right = side_means(raw, self.sides, self.modes)
         return left, right, raw
 
 
@@ -336,6 +321,46 @@ def _mean(values: Iterable[float]) -> float:
     if not vals:
         return 0.0
     return sum(vals) / len(vals)
+
+
+# ---------------------------------------------------------------------------
+# Pure aggregation helpers.
+#
+# Pulled out of WheelEncoders as free functions because the multiprocess build
+# needs them in a process that owns no encoder objects: P_sensors publishes the
+# RAW per-motor totals to shared memory and P_control applies the signs, the
+# single-phase scaling and the side averaging (see ipc.SharedEncoderReader).
+# Duplicating the single-phase rule on the reader side is exactly the kind of
+# drift that would show up as a slow heading bias, so there is one copy of it.
+# ---------------------------------------------------------------------------
+def resolve_count(tag: str, raw: Dict[str, float], signs: Dict[str, int],
+                  modes: Dict[str, dict]) -> float:
+    """Turn a raw per-motor count into a sign/scale-corrected count.
+
+    Normal motors: raw * sign. Single-phase motors: unsigned magnitude, scaled
+    to the x4 tick base, with direction borrowed from the healthy same-side
+    partner (a lone phase can't sense rotation direction).
+    """
+    mode = modes.get(tag)
+    if mode:
+        partner = mode.get("direction_from")
+        scale = mode.get("scale", 1.0)
+        partner_signed = raw.get(partner, 0) * signs.get(partner, 1)
+        direction = 1 if partner_signed >= 0 else -1
+        return abs(raw[tag]) * scale * direction
+    return raw[tag] * signs.get(tag, 1)
+
+
+def side_means(raw: Dict[str, float], sides, modes: Dict[str, dict],
+               ) -> Tuple[float, float]:
+    """Sign/scale-corrected mean count for (left, right) from raw per-motor
+    counts. ``raw`` may be lifetime totals or per-tick deltas alike."""
+    signs = sides.signs
+    left = _mean(resolve_count(t, raw, signs, modes) for t in sides.left
+                 if t in raw)
+    right = _mean(resolve_count(t, raw, signs, modes) for t in sides.right
+                  if t in raw)
+    return left, right
 
 
 if __name__ == "__main__":
