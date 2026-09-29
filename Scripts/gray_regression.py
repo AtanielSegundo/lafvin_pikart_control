@@ -300,12 +300,13 @@ class Rig:
             print("[encoders] modo enxuto: so M1 (esq) e M4 (dir) -- metade "
                   "das callbacks, e sem o remendo de fase unica do M3")
         else:
-            self.encoders = WheelEncoders(CONFIG.sides)
+            sides = CONFIG.sides
+            self.encoders = WheelEncoders(sides)
         self.enc_tags = tuple(self.encoders.encoders)
         self.encoders.begin()          # registers the pigpio edge callbacks --
                                        # without it every count stays 0 forever
         self.odom     = SkidSteerOdometry(CONFIG.wheel)
-        self.mpc      = CONFIG.wheel.meters_per_count
+        self.mpc_l, self.mpc_r = CONFIG.wheel.meters_per_count(sides)
         self._prev_yaw = None
         self._prev_yaw_t = 0.0
         self._vbat = ""
@@ -466,8 +467,8 @@ def _sample_run(rig, writer, run_id, duty_fn, max_time,
         ticks += 1
         dt_max = max(dt_max, dt)
 
-        d_left   = dc_l * rig.mpc
-        d_right  = dc_r * rig.mpc
+        d_left   = dc_l * rig.mpc_l
+        d_right  = dc_r * rig.mpc_r
         d_center = (d_left + d_right) / 2.0
 
         # Acquisition health, judged per tick and reported once at the end.

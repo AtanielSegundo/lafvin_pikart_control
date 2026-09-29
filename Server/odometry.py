@@ -109,8 +109,8 @@ class SkidSteerOdometry:
         return self.pose
 
     def update_from_counts(self, d_counts_left: int, d_counts_right: int,
-                           dt: float) -> Pose:
+                           dt: float, sides=None) -> Pose:
         """Convenience wrapper: convert encoder count deltas to distances."""
-        mpc = self.geometry.meters_per_count
-        return self.update_from_distances(d_counts_left * mpc,
-                                          d_counts_right * mpc, dt)
+        mpc_left, mpc_right = self.geometry.meters_per_count(sides)
+        return self.update_from_distances(d_counts_left * mpc_left,
+                                          d_counts_right * mpc_right, dt)

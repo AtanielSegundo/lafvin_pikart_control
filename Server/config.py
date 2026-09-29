@@ -12,6 +12,7 @@ platform where the two left wheels and the two right wheels are each driven as
 one "virtual" side.
 """
 from __future__ import annotations
+from typing import *
 
 import math
 from dataclasses import dataclass, field
@@ -31,8 +32,12 @@ class WheelGeometry:
     diameter: float = 0.065            # m
     colinear_distance: float = 0.095   # m, between motors on the same axle
     track: float = TRACK_COEF*0.151    # m, distance between left and right sides
-    counts_per_rev: int = CNT_REV_COEF*2340        
-                    # (quadrature x4). CALIBRATE for your build.
+    # counts_per_rev: int = CNT_REV_COEF*2340
+    # Per-motor counts per wheel revolution, in the x4 quadrature base.
+    # NOTE for M3 (single-phase): `_resolve` already scales its raw phase-A
+    # count x2, so this value must be the POST-scale figure, not the ~1270
+    # ticks/rev the lone phase actually produces.
+    motor_counts_per_rev: Dict[str, int] = field(default_factory=lambda: {"M1": 2533, "M2": 2535, "M3": 2560, "M4": 2534})
 
     @property
     def radius(self) -> float:
@@ -42,10 +47,24 @@ class WheelGeometry:
     def circumference(self) -> float:
         return math.pi * self.diameter
 
-    @property
-    def meters_per_count(self) -> float:
-        """Linear distance travelled by a wheel per single encoder count."""
-        return self.circumference / self.counts_per_rev
+    def meters_per_count(self, sides: "SideMapping" = None) -> Tuple[float, float]:
+        """(left, right) metres travelled per single encoder count.
+
+        Takes the side mapping rather than reading ``SideMapping``'s class
+        defaults: gray_regression's --lean-encoders runs one motor per side
+        (``SideMapping(left=("M1",), right=("M4",))``), and averaging the class
+        default's pairs there would silently use the wrong motors.
+
+        Averaging each side's counts_per_rev is exact whenever both wheels on a
+        side travel together -- mean(c)*circ/mean(cpr) reduces to d for any cpr
+        split when d_1 == d_2 -- and degrades to a cpr-weighted average only
+        during intra-side slip, which the odometry cannot observe anyway.
+        """
+        sides = sides if sides is not None else CONFIG.sides
+        cpr = self.motor_counts_per_rev
+        mean = lambda tags: sum(cpr[t] for t in tags) / len(tags)
+        return (self.circumference / mean(sides.left),
+                self.circumference / mean(sides.right))
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +227,7 @@ SINGLE_PHASE_ENCODERS: Dict[str, dict] = {
 # no logic changes needed.
 @dataclass(frozen=True)
 class SideMapping:
-    left: Tuple[str, ...] = ("M1", "M2")
+    left: Tuple[str, ...]  = ("M1", "M2")
     right: Tuple[str, ...] = ("M3", "M4")
     # Per-motor count direction (+1 / -1).
     signs: Dict[str, int] = field(default_factory=lambda: {

@@ -567,9 +567,10 @@ class DriveController:
         # 1. Feedback: encoder deltas (translation) + gyro yaw (rotation).
         d_counts_left, d_counts_right = self.encoders.read_reset_sides()
 
-        mpc = self.config.wheel.meters_per_count
-        d_left = d_counts_left * mpc
-        d_right = d_counts_right * mpc
+        mpc_left, mpc_right = self.config.wheel.meters_per_count(self.config.sides)
+        
+        d_left  = d_counts_left  * mpc_left
+        d_right = d_counts_right * mpc_right
 
         # Gyro yaw -> per-step d_theta (rad). Ground truth when connected;
         # odometry falls back to the encoder differential when it is None.
@@ -979,9 +980,9 @@ class SimulatedDrivePlant:
         self._speed_left += alpha * (self.gain * duty_left - self._speed_left)
         self._speed_right += alpha * (self.gain * duty_right - self._speed_right)
 
-        mpc = self.config.wheel.meters_per_count
-        counts_left = (self._speed_left * dt) / mpc
-        counts_right = (self._speed_right * dt) / mpc
+        mpc_left, mpc_right = self.config.wheel.meters_per_count(self.config.sides)
+        counts_left = (self._speed_left * dt) / mpc_left
+        counts_right = (self._speed_right * dt) / mpc_right
         self._inject(self.config.sides.left, counts_left)
         self._inject(self.config.sides.right, counts_right)
 

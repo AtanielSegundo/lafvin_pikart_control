@@ -210,6 +210,84 @@ class TestSharedEncoderReader(unittest.TestCase):
                          {"M1": 1, "M2": 2, "M3": 3, "M4": 4})
 
 
+class TestMetersPerCount(unittest.TestCase):
+    """Per-motor counts_per_rev, averaged per side."""
+
+    def test_uniform_counts_match_the_old_scalar(self):
+        """With one cpr for every motor this must reduce to the single scalar
+        the config used before. Derived from the geometry, not hardcoded: the
+        shipped values come from Scripts/counts_per_rev.py and change whenever
+        the kart is recalibrated."""
+        from config import WheelGeometry
+        geom = WheelGeometry(motor_counts_per_rev={t: 2540
+                                                   for t in ENCODER_TAGS})
+        left, right = geom.meters_per_count(SideMapping())
+        expected = geom.circumference / 2540
+        self.assertAlmostEqual(left, expected, places=12)
+        self.assertAlmostEqual(right, expected, places=12)
+
+    def test_shipped_calibration_is_sane(self):
+        """Guard the real values: all four motors present, and in the x4 base.
+        M3 is measured on one phase (~1280) and must be stored doubled, so a
+        value near 1280 means someone pasted the raw figure."""
+        from config import CONFIG
+        cpr = CONFIG.wheel.motor_counts_per_rev
+        self.assertEqual(set(cpr), set(ENCODER_TAGS))
+        for tag, value in cpr.items():
+            self.assertGreater(value, 2000, f"{tag}={value} looks like a raw "
+                                            f"single-phase count, not x4")
+            self.assertLess(value, 3000, f"{tag}={value} is out of range")
+
+    def test_sides_are_averaged_independently(self):
+        from config import WheelGeometry
+        geom = WheelGeometry(motor_counts_per_rev={"M1": 2400, "M2": 2600,
+                                                   "M3": 1000, "M4": 3000})
+        left, right = geom.meters_per_count(SideMapping())
+        self.assertAlmostEqual(left, geom.circumference / 2500, places=12)
+        self.assertAlmostEqual(right, geom.circumference / 2000, places=12)
+
+    def test_honours_a_one_motor_per_side_mapping(self):
+        """gray_regression's --lean-encoders drives M1/M4 only. Reading
+        SideMapping's CLASS defaults here would average M1+M2 and M3+M4 --
+        the wrong motors, silently."""
+        from config import WheelGeometry
+        geom = WheelGeometry(motor_counts_per_rev={"M1": 2400, "M2": 9999,
+                                                   "M3": 9999, "M4": 3000})
+        lean = SideMapping(left=("M1",), right=("M4",))
+        left, right = geom.meters_per_count(lean)
+        self.assertAlmostEqual(left, geom.circumference / 2400, places=12)
+        self.assertAlmostEqual(right, geom.circumference / 3000, places=12)
+
+    def test_averaging_cpr_is_exact_when_both_wheels_travel_together(self):
+        """Why the mean is not an approximation in the case that matters: for
+        d_left == d_right the cpr split cancels out entirely."""
+        from config import WheelGeometry
+        from encoders import side_means
+        geom = WheelGeometry(motor_counts_per_rev={"M1": 2400, "M2": 2600,
+                                                   "M3": 2400, "M4": 2600})
+        sides = SideMapping(signs={t: 1 for t in ENCODER_TAGS})
+        travel = 0.25                                  # m, every wheel alike
+        counts = {t: travel * geom.motor_counts_per_rev[t] / geom.circumference
+                  for t in ENCODER_TAGS}
+        mean_left, _ = side_means(counts, sides, {})
+        mpc_left, _ = geom.meters_per_count(sides)
+        self.assertAlmostEqual(mean_left * mpc_left, travel, places=12)
+
+    def test_update_from_counts_does_not_multiply_by_a_tuple(self):
+        """int * tuple REPEATS the tuple in Python, so a scalar caller of the
+        now-two-valued meters_per_count corrupts the pose instead of raising."""
+        from config import WheelGeometry
+        from odometry import SkidSteerOdometry
+        geom = WheelGeometry(motor_counts_per_rev={t: 2540
+                                                   for t in ENCODER_TAGS})
+        odom = SkidSteerOdometry(geom)
+        pose = odom.update_from_counts(1000, 1000, 0.05, SideMapping())
+        self.assertIsInstance(pose.x, float)
+        self.assertAlmostEqual(pose.x, 1000 * geom.circumference / 2540,
+                               places=9)
+        self.assertAlmostEqual(pose.theta, 0.0, places=12)
+
+
 class TestSharedGyroReader(unittest.TestCase):
     """The staleness contract. Inside one process, `connected` was enough. Across
     processes a killed producer leaves its last yaw in shared memory forever, and
