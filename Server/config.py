@@ -135,7 +135,7 @@ class PositionGains:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class HeadingGains:
-    kp: float = 9308.24 /2       # duty per rad of heading error
+    kp: float = 2 * 9308.24 /4       # duty per rad of heading error
     ki: float = 10359.7 /2     # gentle backstop for a residual degree or two;
                               # bounded by integral_limit below
     kd: float = 2054.4        # duty per (rad/s) -- damping. THE anti-overshoot
