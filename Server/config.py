@@ -91,11 +91,11 @@ class PIDGains:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class PositionGains:
-    kp: float = 10000.0      # duty per metre of error
+    kp: float = 9000.0      # duty per metre of error
     ki: float = 2000.0       # gentle backstop for residual error; its
                              # contribution is bounded by integral_limit below
     kd: float = 1000.0       # duty per (m/s) — damping
-    output_limit  : float = 2000.0  # CRUISE duty cap. Keep within the rate the
+    output_limit  : float = 2100.0  # CRUISE duty cap. Keep within the rate the
                                     # encoders can count -- at high duty (~3000)
                                     # the wheel spins faster than the quadrature
                                     # decoder tracks, counts are dropped, travel
@@ -135,7 +135,7 @@ class PositionGains:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class HeadingGains:
-    kp: float = 2 * 9308.24 /4       # duty per rad of heading error
+    kp: float = 9308.24       # duty per rad of heading error
     ki: float = 10359.7 /2     # gentle backstop for a residual degree or two;
                               # bounded by integral_limit below
     kd: float = 2054.4        # duty per (rad/s) -- damping. THE anti-overshoot
@@ -247,7 +247,7 @@ MOTOR_CHANNELS = {
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class ControlConfig:
-    loop_hz                  : float = 20.0
+    loop_hz                  : float = 50.0
     telemetry_hz             : float = 10.0
     command_timeout          : float = 0.1   # s; stop motors if no drive cmd arrives
     minimum_front_distance_cm: int   = 10    # front guard trips below this (cm)
