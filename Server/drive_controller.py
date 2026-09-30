@@ -44,6 +44,7 @@ from config import CONFIG, RobotConfig
 from kinematics import SkidSteerKinematics, Twist, WheelSpeeds
 from odometry import Pose, SkidSteerOdometry, wrap_angle
 from pid import PID
+from slip import SlipDetector
 
 if TYPE_CHECKING:
     # Import for type hints only: GyroMPU pulls in mpu6050, absent off-Pi.
@@ -154,6 +155,9 @@ class DriveController:
 
         self.kin  = SkidSteerKinematics(config.wheel)
         self.odom = SkidSteerOdometry(config.wheel)
+        # Slip detector: gyro yaw vs. the encoder differential. Owns no
+        # hardware -- it is fed the two rotation deltas step() already has.
+        self.slip = SlipDetector(config)
 
         # Velocity PIDs (teleop / `drive`): error in m/s -> duty.
         gains = config.pid
@@ -584,6 +588,13 @@ class DriveController:
         else:
             self._gyro_yaw_prev = None       # reset so a reconnect doesn't jump
 
+        # Slip check, BEFORE the odometry update consumes the deltas. The
+        # encoder differential is exactly the rotation odometry would have
+        # integrated had there been no gyro, so comparing it against the gyro
+        # costs one subtraction and reuses feedback already in hand.
+        d_theta_enc = (d_right - d_left) / self.config.wheel.track
+        self.slip.update(d_theta_enc, gyro_dtheta, dt)
+
         self.odom.update_from_distances(d_left, d_right, dt, d_theta=gyro_dtheta)
         # Raw-turn heading override: a scheduled open-loop turn forces the odom
         # heading (there's no gyro) so telemetry reflects the turn. Applied here
@@ -760,6 +771,7 @@ class DriveController:
                      "source": "gyro" if gyro_dtheta is not None else "encoder",
                      "heading": heading_info},
             "encoders": self.encoders.raw_totals(),   # raw per-motor counts
+            "slip": self.slip.telemetry(),
         }
         with self._lock:
             self._telemetry = snapshot
@@ -901,6 +913,7 @@ class DriveController:
             "gyro": {"connected": False, "yaw_deg": 0.0,
                      "source": "encoder", "heading": None},
             "encoders": {},
+            "slip": SlipDetector.blank_telemetry(),
         }
 
 

@@ -257,6 +257,65 @@ class ControlConfig:
     max_angular: float = 4.0  # rad/s
 
 
+# ---------------------------------------------------------------------------
+# Slip detection: gyro yaw rate vs. the encoder differential.
+#
+# The kart carries two independent measurements of the SAME quantity every tick:
+#
+#   d_theta_gyro    from the MPU6050 (ground truth -- slip-immune, since the
+#                   chassis rotates whether or not the wheels grip)
+#   d_theta_encoder (d_right - d_left) / track  (believes the wheels)
+#
+# ``step`` already computes both and then throws the encoder one away whenever
+# the gyro is live. Their DISAGREEMENT is a slip detector, and a better one than
+# the accelerometer test in the literature (De Giorgi et al., Robotics 2024,
+# 13, 7, Eq. 7-8) gives on this hardware: yaw rate is the one thing an MPU6050
+# measures well, while double-integrating its accelerometer for displacement is
+# hopeless at this price point.
+#
+# What it catches: wheels scrubbing sideways in an in-place turn, one side
+# spinning up on a slick patch, a wheel blocked against a wall while the other
+# drives. All of those make the encoders claim a rotation the chassis did not
+# perform (or miss one it did).
+#
+# What it does NOT catch: both sides slipping equally in a straight line. The
+# differential is zero in that case and so is the gyro, so the residual stays
+# quiet while the kart makes no progress. That mode needs an exteroceptive
+# reference (which is what the orchestrator's 1-D range correction provides).
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class SlipConfig:
+    # Absolute floor on the residual, in rad/s of disagreement. Sized above the
+    # honest noise of the two sources at 20 Hz: one dropped encoder count on a
+    # side is ~(mpc/track)/dt ~ 0.01 rad/s, and the gyro's own rate noise after
+    # bias removal is a few hundredths.
+    rate_tolerance: float = 0.35
+
+    # Proportional term: allow this fraction of the LARGER of the two rates
+    # before calling it slip. A fast turn legitimately disagrees by more in
+    # absolute terms than a slow one (quantisation, the 20 Hz sampling of a
+    # ramping rate), so a fixed threshold alone would flag every hard turn.
+    rate_fraction: float = 0.30
+
+    # Consecutive ticks over the threshold before `slipping` latches true, and
+    # consecutive clean ticks before it clears. Slip is a physical event lasting
+    # many ticks at 20 Hz; a single-tick spike is a sample alignment artefact
+    # (the encoder delta and the gyro delta are read microseconds apart but
+    # cover slightly different windows). Mirrors the paper's own advice to test
+    # the condition over "few steps instead of only one" (Remark 1).
+    enter_ticks: int = 3
+    exit_ticks: int = 5
+
+    # Below this body rate BOTH sources read ~0 and their ratio is meaningless,
+    # so the detector stays quiet -- it has nothing to compare. Prevents a
+    # parked kart from latching slip on pure noise.
+    min_rate: float = 0.15
+
+    # Ratio reported in telemetry is clamped here, purely so a division by a
+    # near-zero gyro rate cannot publish an absurd number to the UI.
+    max_ratio: float = 10.0
+
+
 @dataclass(frozen=True)
 class NetworkConfig:
     web_port: int = 8080
@@ -335,6 +394,7 @@ class RobotConfig:
     control : ControlConfig = field(default_factory=ControlConfig)
     network : NetworkConfig = field(default_factory=NetworkConfig)
     process : ProcessConfig = field(default_factory=ProcessConfig)
+    slip    : SlipConfig    = field(default_factory=SlipConfig)
 
 
 CONFIG = RobotConfig()

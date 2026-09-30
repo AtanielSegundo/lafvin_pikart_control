@@ -32,7 +32,6 @@ class Twist:
     linear: float = 0.0    # m/s, +x forward
     angular: float = 0.0   # rad/s, +ccw
 
-
 @dataclass(frozen=True)
 class WheelSpeeds:
     """Linear speed of each virtual side, m/s."""
