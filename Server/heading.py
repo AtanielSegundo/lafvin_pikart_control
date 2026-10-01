@@ -58,9 +58,9 @@ class MPU6050_CFG:
 class GyroMPU:
     def __init__(self,
                  sample_rate: float = SAMPLE_HZ,
-                 accel_range: int = mpu6050.ACCEL_RANGE_4G,
-                 gyro_range:  int = mpu6050.GYRO_RANGE_1000DEG,
-                 filter_bw:   int = mpu6050.FILTER_BW_256,
+                 accel_range: int = mpu6050.ACCEL_RANGE_2G,
+                 gyro_range:  int = mpu6050.GYRO_SCALE_MODIFIER_500DEG,
+                 filter_bw:   int = mpu6050.FILTER_BW_188,
                  comp_alpha:  float = 0.98,       # gyro weight in the x/y filter
                  yaw_axis:    str = YAW_AXIS,     # which integrated axis is yaw
                  yaw_sign:    int = YAW_SIGN,     # +1 if that axis is + for CCW

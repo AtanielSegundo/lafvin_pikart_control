@@ -247,7 +247,7 @@ MOTOR_CHANNELS = {
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class ControlConfig:
-    loop_hz                  : float = 50.0
+    loop_hz                  : float = 20.0
     telemetry_hz             : float = 10.0
     command_timeout          : float = 0.1   # s; stop motors if no drive cmd arrives
     minimum_front_distance_cm: int   = 10    # front guard trips below this (cm)
