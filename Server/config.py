@@ -91,11 +91,11 @@ class PIDGains:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class PositionGains:
-    kp: float = 9000.0      # duty per metre of error
-    ki: float = 2000.0       # gentle backstop for residual error; its
+    kp: float = 6000.0      # duty per metre of error
+    ki: float = 4000.0       # gentle backstop for residual error; its
                              # contribution is bounded by integral_limit below
-    kd: float = 1000.0       # duty per (m/s) — damping
-    output_limit  : float = 2100.0  # CRUISE duty cap. Keep within the rate the
+    kd: float = 1600.0       # duty per (m/s) — damping
+    output_limit  : float = 2200.0  # CRUISE duty cap. Keep within the rate the
                                     # encoders can count -- at high duty (~3000)
                                     # the wheel spins faster than the quadrature
                                     # decoder tracks, counts are dropped, travel
@@ -148,15 +148,15 @@ class HeadingGains:
     integral_limit: float = 800.0
     # Deceleration ceiling, same idea as PositionGains.decel_gain: cap |duty| at
     # decel_gain*sqrt(|err|) so the approach follows w ~ sqrt(2*a*theta).
-    decel_gain    : float = 1600.0
+    decel_gain    : float = 1800.0
     min_turn_duty : float = 1200.0
     pulse_floor   : bool  = True
     tolerance     : float = 0.008726646259971648 # 0.5 deg
-    settle_rate   : float = 1.2     # rad/s (~7 deg/s). Loosening this is the
+    settle_rate   : float = 1.8     # rad/s (~7 deg/s). Loosening this is the
                                      # fastest way to reintroduce overshoot: the
                                      # kart coasts for whatever rate it is still
                                      # carrying when the loop lets go.
-    settle_ticks  : int   = 2
+    settle_ticks  : int   = 3
     max_time      : float = 20.0     # s, safety timeout per turn (was 6.0; the
                                      # damped approach trades speed for accuracy)
 
