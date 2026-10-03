@@ -147,20 +147,32 @@ class Server:
     # ------------------------------------------------------------------
     # Queue helpers
     # ------------------------------------------------------------------
+    # Every enqueue below is strictly non-blocking (drop_timeout=0). These run
+    # on whichever thread dispatched the command, and for the WebSocket and
+    # HTTP paths that is the asyncio event loop itself -- the same thread that
+    # has to keep answering clients. The blocking variant's worst case (3 x
+    # 20 ms while making room in a full queue) is harmless on a worker thread
+    # and a visible stall here. A full queue already means the consumer is
+    # wedged, so there is nothing to gain by waiting on it either.
+    _ENQUEUE_TIMEOUT = 0.0
+
     def _to_control(self, name: str, **kwargs) -> None:
         # Stamped at ingress: the control loop's staleness test
         # (control.command_timeout) should measure the age of the operator's
         # intent, not the moment the queue happened to be drained.
         kwargs.setdefault('ts', time.monotonic())
         ipc_mod.put_drop_oldest(self.ipc.control_q,
-                                Command(name=name, kwargs=kwargs))
+                                Command(name=name, kwargs=kwargs),
+                                drop_timeout=self._ENQUEUE_TIMEOUT)
 
     def _to_aux(self, name: str, **kwargs) -> None:
-        ipc_mod.put_drop_oldest(self.ipc.aux_q, Command(name=name, kwargs=kwargs))
+        ipc_mod.put_drop_oldest(self.ipc.aux_q, Command(name=name, kwargs=kwargs),
+                                drop_timeout=self._ENQUEUE_TIMEOUT)
 
     def _to_sensors(self, name: str, **kwargs) -> None:
         ipc_mod.put_drop_oldest(self.ipc.sensors_q,
-                                Command(name=name, kwargs=kwargs))
+                                Command(name=name, kwargs=kwargs),
+                                drop_timeout=self._ENQUEUE_TIMEOUT)
 
     # ------------------------------------------------------------------
     # Networking

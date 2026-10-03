@@ -19,6 +19,7 @@ Usage:
     sudo python3 web.py --no-camera  # Skip the camera process
 """
 import asyncio
+import concurrent.futures
 import os
 import sys
 import threading
@@ -34,6 +35,12 @@ import protocol
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
 WEB_PORT = CONFIG.network.web_port
+
+# Threads reserved for MJPEG viewers. Each in-flight viewer holds one for the
+# duration of a blocking frame read, so this is also the cap on simultaneous
+# streams -- beyond it, extra viewers queue for a slot instead of crowding out
+# the rest of the process.
+VIDEO_POOL_WORKERS = 4
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +68,8 @@ async def video_handler(request):
     loop = asyncio.get_event_loop()
     try:
         while True:
-            frame = await loop.run_in_executor(None, reader.read, 2.0)
+            frame = await loop.run_in_executor(request.app['video_pool'],
+                                               reader.read, 2.0)
             if frame is None:
                 # Timed out: either the camera has not started yet or it stopped.
                 # Fall through so a disconnected client is noticed on the next
@@ -172,6 +180,14 @@ async def _start_background(app):
     app['telemetry_task'] = asyncio.create_task(telemetry_broadcaster(app))
 
 
+async def _shutdown_video_pool(app):
+    pool = app.get('video_pool')
+    if pool is not None:
+        # Don't wait: the workers may be mid-read with up to 2 s left on the
+        # clock, and shutdown should not block on a viewer that already left.
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
 async def _stop_background(app):
     task = app.get('telemetry_task')
     if task:
@@ -189,6 +205,18 @@ def create_app(server_instance):
     app = web.Application()
     app['server'] = server_instance
     app['ws_clients'] = set()
+    # A POOL OF ITS OWN, not asyncio's default executor.
+    #
+    # Each viewer parks a thread in a blocking ring read for up to 2 s at a
+    # time, and re-enters it immediately. On the default executor -- shared with
+    # everything else this process ever offloads -- two viewers were enough to
+    # keep it permanently saturated with tasks that are blocked in an OS
+    # semaphore (which, unlike a sleep, yields nothing cooperatively). Giving
+    # video its own bounded pool means a crowd of viewers can starve video and
+    # nothing else.
+    app['video_pool'] = concurrent.futures.ThreadPoolExecutor(
+        max_workers=VIDEO_POOL_WORKERS, thread_name_prefix='video')
+    app.on_cleanup.append(_shutdown_video_pool)
     app.router.add_get('/', index_handler)
     app.router.add_get('/video', video_handler)
     app.router.add_get('/ws', websocket_handler)

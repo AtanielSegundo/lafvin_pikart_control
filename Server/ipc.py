@@ -167,7 +167,15 @@ def put_drop_oldest(q, item, drop_timeout: float = 0.02) -> bool:
 
     for _ in range(3):
         try:
-            q.get(timeout=drop_timeout)  # drop oldest
+            # drop_timeout=0 asks for a strictly non-blocking drop. Callers on
+            # an event loop pass that: up to 3 x 20 ms of blocking is nothing
+            # on a worker thread but is a visible stall on the thread that also
+            # answers WebSocket commands, which is exactly where a stalled
+            # command path starts.
+            if drop_timeout > 0.0:
+                q.get(timeout=drop_timeout)
+            else:
+                q.get_nowait()           # drop oldest
         except _queue.Empty:
             pass                         # feeder still in flight; try the put
         except (OSError, ValueError):
@@ -233,9 +241,11 @@ class FrameRing:
         self._meta = ctx.RawArray("q", self.slots * 2)   # (seq, length) per slot
         self._seq = ctx.RawValue("q", 0)
         self._dropped = ctx.RawValue("q", 0)
-        # One condition guards seq/meta/buf together. The critical section is a
-        # single memcpy (tens of microseconds), so a lock is cheaper and far
-        # easier to reason about than a seqlock retry loop here.
+        self._torn = ctx.RawValue("q", 0)                # reads lost to a reuse
+        # The condition guards the BOOKKEEPING (seq/meta) and wakes waiters. It
+        # is deliberately NOT held while a reader copies a frame out -- see
+        # `read` for why that difference is the whole ballgame with more than
+        # one viewer.
         self._cond = ctx.Condition()
         self._view = None                                # lazily, per process
 
@@ -262,13 +272,29 @@ class FrameRing:
         with self._cond:
             seq = self._seq.value + 1
             slot = seq % self.slots
-            off = slot * self.slot_bytes
-            self._mem()[off:off + n] = data
+            # Invalidate the slot BEFORE touching its bytes. A reader that is
+            # mid-copy out of this slot re-checks this field afterwards (see
+            # `read`); if it still held the old sequence while the bytes were
+            # being overwritten, the reader would re-check against a stale
+            # match and hand out a spliced frame. -1 matches no sequence.
+            self._meta[2 * slot] = -1
+
+        off = slot * self.slot_bytes
+        self._mem()[off:off + n] = data
+
+        with self._cond:
             self._meta[2 * slot] = seq
             self._meta[2 * slot + 1] = n
             self._seq.value = seq
             self._cond.notify_all()
         return True
+
+    @property
+    def torn(self) -> int:
+        """Reads abandoned because the writer recycled the slot mid-copy. A
+        steadily rising count means the ring is too short for how slowly
+        viewers are draining it -- raise `frame_slots`."""
+        return self._torn.value
 
     # -- readers (P_web, legacy TCP video) ---------------------------------
     @property
@@ -285,6 +311,24 @@ class FrameRing:
         Returns ``(jpeg_bytes, seq)``, or ``(None, last_seq)`` on timeout so the
         caller can re-check its own liveness (a client that went away, a camera
         that never started) instead of hanging forever.
+
+        The copy happens OUTSIDE the lock -- a seqlock, not a mutex around the
+        memcpy. The earlier version held the condition for the whole read, which
+        worked with one viewer and deadlocked the web process with two: both
+        readers wait on the same condition, ``notify_all`` wakes both, and
+        ``wait_for`` only returns once it has REACQUIRED the lock. The two then
+        take turns holding it to copy ~30 KB each while the publisher in
+        P_camera blocks trying to acquire the very same lock to write the next
+        frame. Those readers run in asyncio's executor, blocked in an OS
+        semaphore that never yields cooperatively, so the stall propagated
+        straight into the WebSocket command path.
+
+        The protocol instead: take the bookkeeping under the lock, release,
+        copy, then re-check that the slot still belongs to the sequence that was
+        read. With `slots` buffers at the camera's frame rate a reader has
+        (slots-1) frame periods to finish its copy, so the re-check virtually
+        never fails -- and when it does, the answer is to skip that frame rather
+        than to serve half of one spliced with half of another.
         """
         with self._cond:
             if self._seq.value <= last_seq:
@@ -294,11 +338,19 @@ class FrameRing:
             if seq <= last_seq:
                 return None, last_seq
             slot = seq % self.slots
-            if self._meta[2 * slot] != seq:      # overwritten mid-read: skip it
+            if self._meta[2 * slot] != seq:      # already recycled: skip it
                 return None, seq
             n = self._meta[2 * slot + 1]
-            off = slot * self.slot_bytes
-            data = bytes(self._mem()[off:off + n])
+
+        # --- lock released: the publisher is free to run while we copy ---
+        off = slot * self.slot_bytes
+        data = bytes(self._mem()[off:off + n])
+
+        # Did the writer lap us mid-copy? Then `data` may splice two frames.
+        # Report the skip instead; the caller asks again and gets a whole one.
+        if self._meta[2 * slot] != seq:
+            self._torn.value += 1
+            return None, seq
         return data, seq
 
 
