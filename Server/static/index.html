@@ -102,6 +102,40 @@ canvas.joystick {
 }
 .extras-inner label { font-size: 13px; color: #888; }
 .battery { font-size: 14px; color: #4cc9f0; }
+
+/* PID tuning table */
+.tune-tabs { display: flex; gap: 6px; margin-bottom: 8px; }
+.tune-tab {
+  flex: 1; padding: 8px; text-align: center; cursor: pointer;
+  border: 2px solid #444; border-radius: 8px; background: #16213e;
+  font-size: 13px; color: #aaa;
+}
+.tune-tab.active { border-color: #0f3460; background: #0f3460; color: #fff; }
+.tune-grid {
+  display: grid; grid-template-columns: 1fr auto auto; gap: 6px 8px;
+  align-items: center;
+}
+.tune-grid label {
+  font-size: 12px; color: #bbb; font-family: ui-monospace, monospace;
+}
+.tune-grid input[type=number] {
+  width: 92px; background: #16213e; color: #eee;
+  border: 1px solid #444; border-radius: 6px; padding: 6px;
+  font-family: ui-monospace, monospace; font-size: 12px;
+}
+.tune-grid input.dirty { border-color: #e9b949; }
+.tune-live {
+  font-size: 11px; color: #666; font-family: ui-monospace, monospace;
+  min-width: 68px; text-align: right;
+}
+.tune-actions { display: flex; gap: 6px; margin-top: 10px; }
+.tune-actions .qbtn { flex: 1; }
+.tune-status {
+  font-size: 11px; margin-top: 8px; min-height: 15px;
+  font-family: ui-monospace, monospace; color: #888;
+}
+.tune-status.ok { color: #4caf50; }
+.tune-status.err { color: #e05263; }
 </style>
 </head>
 <body>
@@ -210,6 +244,29 @@ canvas.joystick {
   </div>
 </details>
 
+<!-- PID tuning -->
+<details class="extras">
+  <summary>PID Tuning</summary>
+  <div class="extras-inner">
+    <div class="tune-tabs">
+      <div class="tune-tab active" id="tabPosition"
+           onclick="selectTuneSection('position')">Position (drive)</div>
+      <div class="tune-tab" id="tabHeading"
+           onclick="selectTuneSection('heading')">Heading (turn)</div>
+    </div>
+    <div style="font-size:11px;color:#888;margin-bottom:8px;">
+      Grey column = value the control loop is running now. Edit, then Apply.
+      Changes are live and are <b>not</b> saved to config.py.</div>
+    <div class="tune-grid" id="tuneGrid"></div>
+    <div class="tune-actions">
+      <div class="qbtn" onclick="applyGains()">Apply</div>
+      <div class="qbtn" onclick="revertGains()">Revert</div>
+      <div class="qbtn" onclick="copyGains()">Copy as Python</div>
+    </div>
+    <div class="tune-status" id="tuneStatus"></div>
+  </div>
+</details>
+
 <!-- Servo controls -->
 <div class="servo-section">
   <div class="slider-row">
@@ -302,6 +359,11 @@ function handleTelemetry(raw) {
   MOTORS.forEach(m => { const el = document.getElementById('raw' + m);
                         if (el && enc[m] != null) el.textContent = enc[m]; });
   if (msg.signs) { Object.assign(signs, msg.signs); updateSignBtns(); }
+  if (msg.gains) {
+    if (msg.gains.position) liveGains.position = msg.gains.position;
+    if (msg.gains.heading) liveGains.heading = msg.gains.heading;
+    refreshTuneValues(false);
+  }
 }
 
 function send(cmd) {
@@ -653,6 +715,191 @@ updateSignBtns();
 
 // --- Battery poll ---
 setInterval(() => { send('CMD_POWER'); }, 5000);
+
+// ---------------------------------------------------------------------
+// PID tuning table
+//
+// The gains live in P_control, so this panel is a VIEW of them, never the
+// source of truth: every telemetry frame carries what the loop is actually
+// running (msg.gains), and the grey column shows that. A field the operator
+// has started editing is left alone so live updates cannot yank the value out
+// from under a half-typed number -- that is what `dirty` tracks.
+// ---------------------------------------------------------------------
+const TUNE_FIELDS = {
+  position: [
+    ['kp',             'duty per m of error'],
+    ['ki',             'integral'],
+    ['kd',             'duty per m/s (damping)'],
+    ['output_limit',   'cruise duty cap'],
+    ['integral_limit', 'anti-windup clamp'],
+    ['decel_gain',     'cap = gain*sqrt(remaining)'],
+    ['min_move_duty',  'anti-stall kick'],
+    ['tolerance',      'm, arrival'],
+    ['stop_speed',     'm/s, considered stopped'],
+    ['max_time',       's, safety timeout'],
+  ],
+  heading: [
+    ['kp',             'duty per rad of error'],
+    ['ki',             'integral'],
+    ['kd',             'duty per rad/s (damping)'],
+    ['output_limit',   'duty cap'],
+    ['integral_limit', 'anti-windup clamp'],
+    ['decel_gain',     'cap = gain*sqrt(|err|)'],
+    ['min_turn_duty',  'stiction floor'],
+    ['pulse_floor',    '1 = pulse the floor, 0 = continuous'],
+    ['tolerance',      'rad, arrival'],
+    ['settle_rate',    'rad/s, must be below to finish'],
+    ['settle_ticks',   'consecutive settled ticks'],
+    ['max_time',       's, safety timeout'],
+  ],
+};
+
+let tuneSection = 'position';
+let liveGains = { position: {}, heading: {} };
+const tuneDirty = new Set();          // "section.field" being edited
+
+function fmtGain(v) {
+  if (v === undefined || v === null) return '--';
+  if (typeof v === 'boolean') return v ? '1' : '0';
+  return (Math.abs(v) >= 1000 || v === 0) ? String(v)
+       : Number(v.toFixed(6)).toString();
+}
+
+function buildTuneGrid() {
+  const grid = document.getElementById('tuneGrid');
+  if (!grid) return;
+  grid.innerHTML = '';
+  for (const [field, hint] of TUNE_FIELDS[tuneSection]) {
+    const label = document.createElement('label');
+    label.textContent = field;
+    label.title = hint;
+
+    const input = document.createElement('input');
+    input.type = 'number';
+    input.step = 'any';
+    input.id = 'tune_' + field;
+    const key = tuneSection + '.' + field;
+    input.addEventListener('input', () => {
+      tuneDirty.add(key);
+      input.classList.add('dirty');
+    });
+
+    const live = document.createElement('span');
+    live.className = 'tune-live';
+    live.id = 'live_' + field;
+
+    grid.appendChild(label);
+    grid.appendChild(input);
+    grid.appendChild(live);
+  }
+  refreshTuneValues(true);
+}
+
+function refreshTuneValues(force) {
+  const values = liveGains[tuneSection] || {};
+  for (const [field] of TUNE_FIELDS[tuneSection]) {
+    const input = document.getElementById('tune_' + field);
+    const live = document.getElementById('live_' + field);
+    if (!input) continue;
+    const v = values[field];
+    if (live) live.textContent = fmtGain(v);
+    // Never overwrite a field the operator is editing.
+    if (force || !tuneDirty.has(tuneSection + '.' + field)) {
+      if (v !== undefined && v !== null) {
+        input.value = (typeof v === 'boolean') ? (v ? 1 : 0) : v;
+      }
+    }
+  }
+}
+
+function selectTuneSection(section) {
+  tuneSection = section;
+  document.getElementById('tabPosition')
+          .classList.toggle('active', section === 'position');
+  document.getElementById('tabHeading')
+          .classList.toggle('active', section === 'heading');
+  buildTuneGrid();
+  setTuneStatus('', '');
+}
+
+function setTuneStatus(text, kind) {
+  const el = document.getElementById('tuneStatus');
+  if (!el) return;
+  el.textContent = text;
+  el.className = 'tune-status' + (kind ? ' ' + kind : '');
+}
+
+function applyGains() {
+  const values = {};
+  let count = 0;
+  for (const [field] of TUNE_FIELDS[tuneSection]) {
+    const input = document.getElementById('tune_' + field);
+    if (!input || input.value === '') continue;
+    const v = Number(input.value);
+    if (!Number.isFinite(v)) {
+      setTuneStatus(field + ': not a number', 'err');
+      return;
+    }
+    // Only send what actually differs: a smaller payload, and the server logs
+    // exactly what the operator changed instead of a dump of every field.
+    const current = (liveGains[tuneSection] || {})[field];
+    const asNum = (typeof current === 'boolean') ? (current ? 1 : 0) : current;
+    if (asNum !== undefined && Math.abs(asNum - v) < 1e-9) continue;
+    values[field] = v;
+    count++;
+  }
+  if (!count) { setTuneStatus('nothing changed', ''); return; }
+  send(JSON.stringify({ type: 'set_gains', section: tuneSection,
+                        values: values }));
+  // Clear dirty so the next telemetry frame can confirm what landed. If the
+  // server clamps or rejects a value, the grey column will disagree with the
+  // box and that is the feedback.
+  for (const field of Object.keys(values)) {
+    tuneDirty.delete(tuneSection + '.' + field);
+    const input = document.getElementById('tune_' + field);
+    if (input) input.classList.remove('dirty');
+  }
+  setTuneStatus('sent ' + count + ' value(s) -- check the grey column', 'ok');
+}
+
+function revertGains() {
+  tuneDirty.clear();
+  for (const [field] of TUNE_FIELDS[tuneSection]) {
+    const input = document.getElementById('tune_' + field);
+    if (input) input.classList.remove('dirty');
+  }
+  refreshTuneValues(true);
+  setTuneStatus('reverted to the live values', '');
+}
+
+function copyGains() {
+  // Runtime changes are not persisted, so this is how a good tune survives a
+  // restart: paste it into Server/config.py.
+  const values = liveGains[tuneSection] || {};
+  const cls = tuneSection === 'position' ? 'PositionGains' : 'HeadingGains';
+  let out = '@dataclass(frozen=True)\nclass ' + cls + ':\n';
+  for (const [field] of TUNE_FIELDS[tuneSection]) {
+    const v = values[field];
+    if (v === undefined) continue;
+    if (field === 'pulse_floor') {
+      out += '    ' + field + ': bool = ' + (v ? 'True' : 'False') + '\n';
+    } else if (field === 'settle_ticks') {
+      out += '    ' + field + ': int = ' + Math.round(v) + '\n';
+    } else {
+      out += '    ' + field + ': float = ' + v + '\n';
+    }
+  }
+  const done = () => setTuneStatus('copied -- paste into Server/config.py', 'ok');
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(out).then(done,
+      () => setTuneStatus('clipboard blocked; see console', 'err'));
+  } else {
+    setTuneStatus('clipboard unavailable; see console', 'err');
+  }
+  console.log(out);
+}
+
+buildTuneGrid();
 
 // --- Keyboard controls (desktop) -> twist via the drive controller ---
 // W/S drive, A/D and Q/E turn. Held keys are folded into the twist that the

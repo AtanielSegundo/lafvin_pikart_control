@@ -92,6 +92,7 @@ class Server:
         self._last_drive = None
         self._last_servo = {}
         self._last_signs = dict(config.sides.signs)
+        self._last_gains = {}
         self._last_control_ts = 0.0
 
         # ------------------------------------------------------------------
@@ -135,6 +136,7 @@ class Server:
         r.register('reset_odometry', self._h_reset_odometry)
         r.register('calibrate_imu',  self._h_calibrate_imu)
         r.register('set_sign',       self._h_set_sign)
+        r.register('set_gains',      self._h_set_gains)
         r.register('servo',          self._h_servo)
         r.register('led',            self._h_led)
         r.register('led_mode',       self._h_led_mode)
@@ -388,6 +390,7 @@ class Server:
                     self._last_drive = latest.get('drive')
                     self._last_servo = latest.get('servo') or {}
                     self._last_signs = latest.get('signs') or self._last_signs
+                    self._last_gains = latest.get('gains') or self._last_gains
                     self._last_control_ts = latest.get('ts', 0.0)
             self._stop_evt.wait(1.0 / max(1.0, self.config.control.telemetry_hz))
 
@@ -398,6 +401,7 @@ class Server:
             drive = self._last_drive
             servo = dict(self._last_servo)
             signs = dict(self._last_signs)
+            gains = dict(self._last_gains)
             control_ts = self._last_control_ts
 
         if drive is None:
@@ -416,6 +420,7 @@ class Server:
             "mode": self.Mode,
             "drive": drive,
             "signs": signs,
+            "gains": gains,
             "servo": servo,
             "light": {"left": light_l, "right": light_r},
             "line": self.ipc.read_line(),
@@ -585,6 +590,22 @@ class Server:
         else:
             self._to_control('set_sign', motor=str(c.get('motor', c.arg(0))),
                              sign=c.num('sign', 1, 1))
+
+    def _h_set_gains(self, c: Command):
+        """Retune the position / heading PID loops at runtime.
+
+        JSON: {"type":"set_gains","section":"position","values":{"kp":6000,...}}
+
+        Forwarded untouched -- validation and clamping live in P_control
+        (ControlApplier.GAIN_LIMITS), next to the loop that has to survive the
+        values. Validating here too would be a second copy of the bounds to
+        drift out of sync, and this process cannot see the live gains anyway.
+        """
+        section = str(c.get('section', ''))
+        values = c.get('values')
+        if not isinstance(values, dict):
+            return
+        self._to_control('set_gains', section=section, values=values)
 
     def _h_mecanum(self, c: Command):
         """Legacy mecanum joystick mix (CMD_M_MOTOR).

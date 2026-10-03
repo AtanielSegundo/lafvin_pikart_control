@@ -164,6 +164,7 @@ async def telemetry_broadcaster(app):
         message = protocol.telemetry_message(
             battery=tel['battery'], mode=tel['mode'], drive=tel['drive'],
             extra={'signs': tel.get('signs'), 'servo': tel.get('servo'),
+                   'gains': tel.get('gains'),
                    'light': tel.get('light'), 'line': tel.get('line'),
                    'processes': tel.get('processes')})
         for ws in list(clients):

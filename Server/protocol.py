@@ -38,6 +38,7 @@ ALIASES: Dict[str, str] = {
     "reset_odometry": "reset_odometry",     # (new)
     "calibrate_imu": "calibrate_imu",       # re-zero the gyro bias (new)
     "set_sign": "set_sign",                 # runtime encoder sign flip (new)
+    "set_gains": "set_gains",               # runtime PID retune (new)
     # peripherals
     "CMD_SERVO": "servo", "servo": "servo",
     "CMD_LED": "led", "led": "led",

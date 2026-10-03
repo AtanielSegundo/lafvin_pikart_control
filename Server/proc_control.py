@@ -32,6 +32,26 @@ import protocol
 from protocol import Command
 
 
+def gains_as_dict(gains) -> dict:
+    """A gains dataclass as plain JSON-safe scalars.
+
+    Used for the telemetry envelope so the tuning UI can show what the control
+    loop is ACTUALLY running, rather than whatever the page was last told. With
+    the gains living in P_control and editable at runtime, the browser's idea
+    of them and the loop's can diverge -- and a tuning table that lies about
+    the current value is worse than none.
+    """
+    import dataclasses
+    out = {}
+    for field in dataclasses.fields(gains):
+        value = getattr(gains, field.name)
+        if isinstance(value, bool):
+            out[field.name] = value
+        elif isinstance(value, (int, float)):
+            out[field.name] = round(float(value), 6)
+    return out
+
+
 class ControlApplier:
     """Applies queued commands to the drivetrain.
 
@@ -69,6 +89,7 @@ class ControlApplier:
         r.register("raw_turn_schedule", self._h_raw_turn_schedule)
         r.register("reset_odometry", self._h_reset_odometry)
         r.register("set_sign", self._h_set_sign)
+        r.register("set_gains", self._h_set_gains)
         r.register("servo", self._h_servo)
         r.register("release", self._h_release)
         r.register("stop", self._h_stop)
@@ -183,6 +204,116 @@ class ControlApplier:
                 signs[motor] = 1 if c.num("sign", 1, 1) >= 0 else -1
         self.ipc.log("control", f"encoder signs now {dict(signs)}")
 
+    #: Fields of PositionGains / HeadingGains that may be tuned at runtime,
+    #: with the bounds a value has to fall inside. Declared as data so the UI,
+    #: the validator and the tests all read the same table, and so a typo in a
+    #: field name is rejected rather than silently setting an attribute nothing
+    #: reads. Bounds are sanity rails, not tuning advice: they exist to stop a
+    #: fat-fingered 22000 from pinning the motors.
+    GAIN_LIMITS = {
+        "position": {
+            "kp": (0.0, 60000.0), "ki": (0.0, 60000.0), "kd": (0.0, 60000.0),
+            "output_limit": (0.0, 4095.0), "integral_limit": (0.0, 4095.0),
+            "tolerance": (0.001, 0.5), "stop_speed": (0.0, 1.0),
+            "max_time": (0.5, 120.0), "min_move_duty": (0.0, 4095.0),
+            "decel_gain": (0.0, 60000.0),
+        },
+        "heading": {
+            "kp": (0.0, 60000.0), "ki": (0.0, 60000.0), "kd": (0.0, 60000.0),
+            "output_limit": (0.0, 4095.0), "integral_limit": (0.0, 4095.0),
+            "decel_gain": (0.0, 60000.0), "min_turn_duty": (0.0, 4095.0),
+            "pulse_floor": (0, 1), "tolerance": (0.0001, 1.5),
+            "settle_rate": (0.01, 20.0), "settle_ticks": (1, 50),
+            "max_time": (0.5, 120.0),
+        },
+    }
+    _INT_FIELDS = {"settle_ticks"}
+    _BOOL_FIELDS = {"pulse_floor"}
+
+    def _h_set_gains(self, c: Command) -> None:
+        """Retune the position / heading loops without restarting the stack.
+
+        Two things have to change together, and missing either one is why this
+        is not a one-liner:
+
+        1. ``config.position`` / ``config.heading`` are frozen dataclasses, and
+           the loop reads several of their fields LIVE every tick (tolerance,
+           decel_gain, min_*_duty, max_time, settle_*). Those are replaced via
+           dataclasses.replace.
+        2. kp/ki/kd/output_limit/integral_limit were COPIED into the PID
+           objects when they were constructed, so replacing the config alone
+           would silently change nothing for the terms that matter most. The
+           live PIDs are patched too.
+
+        Only this process's copy of CONFIG is touched -- after the fork each
+        process has its own, and the gains are meaningful only here.
+        """
+        import dataclasses
+
+        section = str(c.get("section", "")).lower()
+        limits = self.GAIN_LIMITS.get(section)
+        if limits is None:
+            self.ipc.log("control", f"set_gains: unknown section {section!r}")
+            return
+
+        values = c.get("values")
+        if not isinstance(values, dict) or not values:
+            self.ipc.log("control", "set_gains: no values")
+            return
+
+        clean, rejected = {}, []
+        for key, raw in values.items():
+            if key not in limits:
+                rejected.append(f"{key} (unknown)")
+                continue
+            try:
+                number = float(raw)
+            except (TypeError, ValueError):
+                rejected.append(f"{key} (not a number)")
+                continue
+            if number != number:                               # NaN
+                rejected.append(f"{key} (NaN)")
+                continue
+            lo, hi = limits[key]
+            if not (lo <= number <= hi):
+                rejected.append(f"{key}={number:g} (outside [{lo:g}, {hi:g}])")
+                continue
+            if key in self._BOOL_FIELDS:
+                clean[key] = bool(number)
+            elif key in self._INT_FIELDS:
+                clean[key] = int(round(number))
+            else:
+                clean[key] = number
+
+        if rejected:
+            self.ipc.log("control", f"set_gains rejected: {', '.join(rejected)}")
+        if not clean:
+            return
+
+        current = getattr(self.config, section)
+        updated = dataclasses.replace(current, **clean)
+        object.__setattr__(self.config, section, updated)
+
+        # Push into the already-built PIDs. A move or turn in flight keeps its
+        # integrator, which is deliberate: resetting mid-move would make the
+        # kart lurch, and the operator retuning gains is watching the kart, not
+        # asking for a discontinuity.
+        if section == "position":
+            for pid in (self.drive.pos_left, self.drive.pos_right):
+                pid.kp, pid.ki, pid.kd = updated.kp, updated.ki, updated.kd
+                pid.output_limit = updated.output_limit
+                pid.integral_limit = updated.integral_limit
+        else:
+            pid = self.drive.heading_pid
+            pid.kp, pid.ki, pid.kd = updated.kp, updated.ki, updated.kd
+            pid.output_limit = updated.output_limit
+            pid.integral_limit = updated.integral_limit
+
+        self.ipc.log("control", f"{section} gains updated: "
+                                f"{', '.join(f'{k}={v:g}' for k, v in clean.items())}")
+        self.ipc.event("gains_changed", section=section,
+                       values=gains_as_dict(updated))
+
     # -- peripherals on the same PCA9685 -----------------------------------
     def _h_servo(self, c: Command) -> None:
         if self.servo is None:
@@ -249,6 +380,11 @@ def run(ipc: ipc_mod.IPC, config=CONFIG) -> None:
                 "drive": snapshot,
                 "servo": dict(servo.angles) if servo is not None else {},
                 "signs": dict(config.sides.signs),
+                # Read fresh each tick, not captured once: _h_set_gains swaps
+                # these dataclasses out at runtime, and the UI has to see the
+                # value the loop is actually using.
+                "gains": {"position": gains_as_dict(config.position),
+                          "heading": gains_as_dict(config.heading)},
                 "ts": time.monotonic(),
             })
 
