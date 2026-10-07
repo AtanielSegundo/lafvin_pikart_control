@@ -44,8 +44,9 @@ SAMPLE_HZ    = 50.0        # integration rate (Hz). Keep high for turns.
 YAW_AXIS = "z"
 YAW_SIGN = -1
 
-GRAVITY_MS2  = 9.80665
-CAL_CACHE    = os.path.join(os.path.dirname(os.path.abspath(__file__)),".mpu6050_cal.json")
+GRAVITY_MS2   = 9.80665
+USE_CAL_CACHE = False 
+CAL_CACHE     = os.path.join(os.path.dirname(os.path.abspath(__file__)),".mpu6050_cal.json")
 CACHE_MAX_DAY_DELTA = 1
 
 @dataclass(frozen=True)
@@ -105,7 +106,8 @@ class GyroMPU:
         self._stop_evt = threading.Event()
         self._thread   = None
 
-        self._load_cache()  # restore last calibration if any
+        if USE_CAL_CACHE: 
+            self._load_cache()  # restore last calibration if any
         self.init_mpu6050()
         if self.connected:
             self.set_configs(accel_range, gyro_range, filter_bw)
@@ -120,7 +122,7 @@ class GyroMPU:
         try:
             port = mpu6050(MPU6050_CFG.ADDR, bus=MPU6050_CFG.I2C_BUS)
             port.get_gyro_data()            # probe: confirm the device answers
-            self.port = port
+            self.port      = port
             self.connected = True
             print(f"[GyroMPU] MPU6050 initialized at 0x{MPU6050_ADDR:02x} on i2c-{I2C_BUS}")
         except Exception as e:                                  # noqa: BLE001
@@ -214,6 +216,7 @@ class GyroMPU:
         gsum = {"x": 0.0, "y": 0.0, "z": 0.0}
         asum = {"x": 0.0, "y": 0.0, "z": 0.0}
         n = 0
+        
         for _ in range(max(1, samples)):
             try:
                 gyro, accel = self._read_raw()
@@ -240,6 +243,7 @@ class GyroMPU:
             self.angles = {"x": roll, "y": pitch, "z": 0.0}
             self.heading = 0.0
             self.calibrated = True
+            
         self._save_cache()
         print(f"[GyroMPU] calibrated over {n} samples: "
               f"bias=({bias['x']:+.3f},{bias['y']:+.3f},{bias['z']:+.3f}) deg/s, "
@@ -258,7 +262,7 @@ class GyroMPU:
                 data = json.load(f)
             if not self._is_cache_valid(data["calibrated_at"]):
                 return
-            self.gyro_bias = {k: float(data["gyro_bias"][k]) for k in ("x", "y", "z")}
+            self.gyro_bias  = {k: float(data["gyro_bias"][k]) for k in ("x", "y", "z")}
             self.calibrated = True
             print(f"[GyroMPU] loaded cached calibration: bias={self.gyro_bias}")
         except (OSError, KeyError, ValueError, TypeError):
