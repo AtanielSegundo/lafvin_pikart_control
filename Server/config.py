@@ -135,28 +135,28 @@ class PositionGains:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class HeadingGains:
-    kp: float = 9308.24       # duty per rad of heading error
-    ki: float = 10359.7 /2    # gentle backstop for a residual degree or two;
+    kp: float = 9308.24 / 2      # duty per rad of heading error
+    ki: float = 10359.7 / 2    # gentle backstop for a residual degree or two;
                               # bounded by integral_limit below
-    kd: float = 2024.4        # duty per (rad/s) -- damping. THE anti-overshoot
+    kd: float = 2054.4        # duty per (rad/s) -- damping. THE anti-overshoot
                               # term: raise it if the kart still swings past,
                               # lower it if the turn crawls or judders. It is
                               # deliberately large -- it has to command REVERSE
                               # duty to brake, since coasting alone carries the
                               # kart tens of degrees past the target.
-    output_limit  : float = 2200.0
+    output_limit  : float = 2800.0
     integral_limit: float = 800.0
     # Deceleration ceiling, same idea as PositionGains.decel_gain: cap |duty| at
     # decel_gain*sqrt(|err|) so the approach follows w ~ sqrt(2*a*theta).
-    decel_gain    : float = 2400.0
+    decel_gain    : float = 1600.0
     min_turn_duty : float = 1200.0
     pulse_floor   : bool  = True
-    tolerance     : float = 0.0017453293 # 0.1 deg
-    settle_rate   : float = 1.6     # rad/s (~7 deg/s). Loosening this is the
+    tolerance     : float = 0.008726646259971648 # 0.0017453293 # 0.1 deg
+    settle_rate   : float = 1.2    # rad/s (~7 deg/s). Loosening this is the
                                      # fastest way to reintroduce overshoot: the
                                      # kart coasts for whatever rate it is still
                                      # carrying when the loop lets go.
-    settle_ticks  : int   = 3
+    settle_ticks  : int   = 2
     max_time      : float = 20.0     # s, safety timeout per turn (was 6.0; the
                                      # damped approach trades speed for accuracy)
 
