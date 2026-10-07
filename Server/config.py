@@ -151,7 +151,7 @@ class HeadingGains:
     decel_gain    : float = 2400.0
     min_turn_duty : float = 1200.0
     pulse_floor   : bool  = True
-    tolerance     : float = 0.008726646259971648 # 0.5 deg
+    tolerance     : float = 0.0017453293 # 0.1 deg
     settle_rate   : float = 1.6     # rad/s (~7 deg/s). Loosening this is the
                                      # fastest way to reintroduce overshoot: the
                                      # kart coasts for whatever rate it is still
