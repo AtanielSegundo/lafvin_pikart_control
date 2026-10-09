@@ -166,6 +166,7 @@ async def telemetry_broadcaster(app):
             extra={'signs': tel.get('signs'), 'servo': tel.get('servo'),
                    'gains': tel.get('gains'),
                    'light': tel.get('light'), 'line': tel.get('line'),
+                   'standstill': tel.get('standstill'),
                    'processes': tel.get('processes')})
         for ws in list(clients):
             if ws.closed:

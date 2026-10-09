@@ -315,6 +315,55 @@ class SlipConfig:
     max_ratio: float = 10.0
 
 
+# ---------------------------------------------------------------------------
+# Standstill detection -- gates the gyro's yaw integration.
+#
+# A bias-corrected MPU6050 still has a residual rate of a few hundredths of a
+# deg/s, plus random-walk noise. Integrated continuously that becomes heading
+# drift that nothing corrects: yaw has no gravity reference the way roll/pitch
+# do (see heading.py). A kart parked for two minutes between legs can acquire
+# several degrees of phantom rotation, and since the drive controller treats
+# gyro yaw as ground truth, the next turn inherits all of it.
+#
+# The fix is to stop integrating while the kart is demonstrably still. "Still"
+# is decided from the ENCODERS, not from the gyro -- asking the gyro whether it
+# should trust itself is circular, and the encoders are unambiguous at zero:
+# wheels that are not turning produce no counts at all.
+#
+# The failure mode this must avoid is freezing during real motion, which would
+# silently discard rotation and corrupt the heading far worse than drift. Hence
+# the asymmetry below: entering standstill is slow and demands total quiet,
+# leaving it is immediate on the first count.
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class StandstillConfig:
+    enabled: bool = True
+
+    # Total counts (summed over all four motors, absolute) within the window
+    # below that still counts as "not moving". Not zero: a wheel resting
+    # exactly on a quadrature edge can dither between two states and emit
+    # counts forever without the kart moving at all.
+    count_tolerance: int = 4
+
+    # How long the encoders must stay quiet before integration is frozen.
+    # Generous on purpose -- a slow creep produces few counts per tick, and
+    # freezing mid-creep would lose real rotation. Drift over a second or two
+    # is negligible; drift over a parked minute is not.
+    enter_quiet_s: float = 1.0
+
+    # Resume integrating the moment the wheels move. No debounce, no hysteresis
+    # in this direction: the cost of resuming one tick early is nothing, while
+    # the cost of resuming one tick late is a lost slice of real rotation.
+    # (This is why the two directions are deliberately not symmetric.)
+    exit_on_first_count: bool = True
+
+    # An in-place turn is the case where the kart rotates while the encoders
+    # may barely register (wheels scrubbing sideways). If the gyro itself
+    # reports a rate above this, motion is assumed regardless of the encoders --
+    # a safety valve against freezing during a real rotation.
+    gyro_rate_floor_dps: float = 3.0
+
+
 @dataclass(frozen=True)
 class NetworkConfig:
     web_port: int = 8080
@@ -394,6 +443,7 @@ class RobotConfig:
     network : NetworkConfig = field(default_factory=NetworkConfig)
     process : ProcessConfig = field(default_factory=ProcessConfig)
     slip    : SlipConfig    = field(default_factory=SlipConfig)
+    standstill: StandstillConfig = field(default_factory=StandstillConfig)
 
 
 CONFIG = RobotConfig()

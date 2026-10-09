@@ -26,9 +26,11 @@ Deps:  pip install mpu6050-raspberrypi
 import json
 import math
 import os
-from datetime import datetime
 import threading
 import time
+
+from typing import *
+from datetime import datetime
 from dataclasses import dataclass
 
 from mpu6050 import mpu6050
@@ -68,18 +70,21 @@ class GyroMPU:
                  cache_path:  str = CAL_CACHE,
                  max_reconect_tries:int = 16,
                  retry_time_ms:float = 300,   # backoff between reconnect tries
+                 fn_to_check_kart_movement : Optional[Callable[[],bool]] = None 
                 ):
 
         self.sample_rate = max(1.0, float(sample_rate))
-        self._period = 1.0 / self.sample_rate
-        self.comp_alpha = comp_alpha
-        self.yaw_axis = yaw_axis
-        self.yaw_sign = yaw_sign
-        self._cache_path = cache_path
-        self.max_reconect_tries = max_reconect_tries
+        self._period             = 1.0 / self.sample_rate
+        self.comp_alpha          = comp_alpha
+        self.yaw_axis            = yaw_axis
+        self.yaw_sign            = yaw_sign
+        self._cache_path         = cache_path
+        self.max_reconect_tries  = max_reconect_tries
         self.reconect_trie_count = 0
-        self._retry_time = max(0.0, retry_time_ms / 1000.0)  # s, reconnect backoff
-
+        self._retry_time         = max(0.0, retry_time_ms / 1000.0)  # s, reconnect backoff
+        _safeCallable = lambda : fn_to_check_kart_movement() if (fn_to_check_kart_movement is not None) else True
+        self._fn_to_check_kart_movement = _safeCallable
+        
         # Desired sensor config, kept so a reconnect can re-apply it.
         self._accel_range = accel_range
         self._gyro_range  = gyro_range
@@ -328,9 +333,14 @@ class GyroMPU:
         # Gyro integration with the calibrated bias removed.
         with self._lock:
             bx, by, bz = self.gyro_bias["x"], self.gyro_bias["y"], self.gyro_bias["z"]
-            gx = (gyro["x"] - bx) * dt + self.angles["x"]
-            gy = (gyro["y"] - by) * dt + self.angles["y"]
-            gz = (gyro["z"] - bz) * dt + self.angles["z"]
+            if self._fn_to_check_kart_movement():
+                gx = (gyro["x"] - bx) * dt + self.angles["x"]
+                gy = (gyro["y"] - by) * dt + self.angles["y"]
+                gz = (gyro["z"] - bz) * dt + self.angles["z"]
+            else:
+                gx = self.angles["x"]
+                gy = self.angles["y"]
+                gz = self.angles["z"]
 
         # Accel gives an absolute roll/pitch reference -- but only trust it when
         # the kart isn't accelerating (|a| ~ 1 g), else linear accel corrupts it.

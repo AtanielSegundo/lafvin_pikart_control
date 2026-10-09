@@ -61,6 +61,7 @@ GYRO_YAW, GYRO_SAMPLE_TS, GYRO_CONNECTED, GYRO_TS = 0, 1, 2, 3
 DIST_CM, DIST_GUARD, DIST_HEALTHY, DIST_TS = 0, 1, 2, 3
 ADC_BATTERY, ADC_LIGHT_L, ADC_LIGHT_R, ADC_TS = 0, 1, 2, 3
 LINE_L, LINE_M, LINE_R, LINE_VALID = 0, 1, 2, 3
+STILL_MOVING, STILL_EVENTS, STILL_FROZEN_S, STILL_TS = 0, 1, 2, 3
 HB_TS, HB_DT, HB_STEPS = 0, 1, 2
 
 _NAN = float("nan")
@@ -390,6 +391,7 @@ class IPC:
         self.dist = ctx.Array("d", 4)
         self.adc = ctx.Array("d", 4)
         self.line = ctx.Array("i", 4)
+        self.standstill = ctx.Array("d", 4)
         self.control_hb = ctx.Array("d", 3)
         self.camera_state = ctx.Array("i", 2)      # (running, refcount)
 
@@ -398,6 +400,11 @@ class IPC:
             self.dist[DIST_HEALTHY] = 1.0
         with self.gyro:
             self.gyro[GYRO_YAW] = 0.0
+        with self.standstill:
+            # Assume motion until P_sensors says otherwise: a consumer that saw
+            # "not moving" before the detector had any data would draw exactly
+            # the wrong conclusion.
+            self.standstill[STILL_MOVING] = 1.0
 
         # -- camera frames -------------------------------------------------
         self.frames = FrameRing(p.frame_slots, p.frame_slot_bytes, ctx=ctx)
@@ -451,6 +458,29 @@ class IPC:
             self.adc[ADC_LIGHT_L] = float(light_l)
             self.adc[ADC_LIGHT_R] = float(light_r)
             self.adc[ADC_TS] = time.monotonic()
+
+    def publish_standstill(self, state: dict) -> None:
+        """Standstill state, for telemetry only.
+
+        Nothing in the control path reads this -- the gate is applied inside
+        GyroMPU, in P_sensors, via a direct callback. This block exists so an
+        operator can SEE that the yaw integration is frozen, which is otherwise
+        invisible and would look identical to a dead gyro.
+        """
+        with self.standstill:
+            self.standstill[STILL_MOVING] = 1.0 if state.get("moving") else 0.0
+            self.standstill[STILL_EVENTS] = float(state.get("frozen_events", 0))
+            self.standstill[STILL_FROZEN_S] = float(state.get("frozen_s", 0.0))
+            self.standstill[STILL_TS] = time.monotonic()
+
+    def read_standstill(self):
+        with self.standstill:
+            if self.standstill[STILL_TS] == 0.0:
+                return None                     # nothing published yet
+            return {"moving": self.standstill[STILL_MOVING] >= 0.5,
+                    "frozen_events": int(self.standstill[STILL_EVENTS]),
+                    "frozen_s": round(self.standstill[STILL_FROZEN_S], 2),
+                    "age": round(time.monotonic() - self.standstill[STILL_TS], 2)}
 
     def publish_line(self, bits: Sequence[int]) -> None:
         with self.line:

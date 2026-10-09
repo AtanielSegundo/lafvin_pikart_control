@@ -424,6 +424,7 @@ class Server:
             "servo": servo,
             "light": {"left": light_l, "right": light_r},
             "line": self.ipc.read_line(),
+            "standstill": self.ipc.read_standstill(),
             "processes": self.supervisor.status(),
         }
 

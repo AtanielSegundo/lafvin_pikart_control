@@ -19,6 +19,10 @@ What lives here and why:
     scheduling jitter: a late sample integrates a stale rate over a longer dt.
   * **ADC and IR line sensors**, so the web layer stops reading GPIO and I2C
     itself (Server.sendLine / sendLight / Power used to).
+  * **Standstill detection**, which gates the gyro's yaw integration. It lives
+    here because it is decided from the encoder totals, and this is the process
+    that owns them -- see standstill.py for why the encoders get that vote and
+    the gyro does not.
 
 Everything is published to shared arrays, never to a queue: these are all
 latest-value-wins signals, and a queue in the encoder path would mean pickling
@@ -186,12 +190,12 @@ def run(ipc: ipc_mod.IPC, config=CONFIG) -> None:
     ipc_mod.apply_process_tuning("sensors", cpu=p.sensors_cpu,
                                  nice=p.sensors_nice)
 
-    pi = None
-    encoders = None
-    gyro = None
-    guard = None
+    pi          = None
+    encoders    = None
+    gyro        = None
+    guard       = None
     adc_monitor = None
-    line = None
+    line        = None
 
     try:
         # -- pigpio: ONE connection for this process, opened after the fork ---
@@ -213,10 +217,28 @@ def run(ipc: ipc_mod.IPC, config=CONFIG) -> None:
         ipc.log("sensors", f"encoders started "
                            f"({'hardware' if encoders.using_hardware else 'simulated'})")
 
+        # -- standstill detector ---------------------------------------------
+        # Built BEFORE the gyro, because the gyro takes its predicate as a
+        # constructor argument and starts its integration thread immediately.
+        from standstill import StandstillDetector
+        standstill = StandstillDetector(config)
+        # Seed it from the current totals so the gyro's first integration steps
+        # see "moving" (the default) rather than a bogus standstill derived from
+        # a baseline that does not exist yet.
+        try:
+            standstill.update(encoders.raw_totals())
+        except Exception:                                       # noqa: BLE001
+            pass
+
         # -- gyro ------------------------------------------------------------
         try:
             from heading import GyroMPU
-            gyro = GyroMPU(sample_rate=50.0)
+            # The predicate is called from the gyro's own 50 Hz thread on every
+            # integration step, and returns False only while the wheels have
+            # been provably quiet -- which is what stops a parked kart from
+            # integrating its residual bias into phantom rotation.
+            gyro = GyroMPU(sample_rate=50.0,
+                           fn_to_check_kart_movement=standstill.is_moving)
             if gyro.is_connected():
                 ipc.log("sensors", "calibrating gyro bias -- keep the kart STILL")
                 gyro.calibrate()
@@ -262,7 +284,7 @@ def run(ipc: ipc_mod.IPC, config=CONFIG) -> None:
         except Exception as exc:                                # noqa: BLE001
             ipc.log("sensors", f"line sensors unavailable ({exc})")
 
-        _publish_loop(ipc, config, encoders, gyro, line)
+        _publish_loop(ipc, config, encoders, gyro, line, standstill)
 
     except Exception as exc:                                    # noqa: BLE001
         import traceback
@@ -291,12 +313,15 @@ def run(ipc: ipc_mod.IPC, config=CONFIG) -> None:
         ipc.log("sensors", "stopped")
 
 
-def _publish_loop(ipc: ipc_mod.IPC, config, encoders, gyro, line) -> None:
+def _publish_loop(ipc: ipc_mod.IPC, config, encoders, gyro, line,
+                  standstill=None) -> None:
     p = config.process
     period = 1.0 / max(1.0, p.sensor_publish_hz)
     line_every = max(1, int(round(p.sensor_publish_hz /
                                   max(1.0, p.line_poll_hz))))
     tick = 0
+    prev_yaw = None
+    prev_yaw_ts = None
 
     while not ipc.stop_evt.is_set():
         start = time.monotonic()
@@ -306,16 +331,40 @@ def _publish_loop(ipc: ipc_mod.IPC, config, encoders, gyro, line) -> None:
         # totals rather than consuming deltas means a skipped publication (a late
         # thread, a stalled bus) self-corrects on the next tick instead of losing
         # counts the way a cross-process read-and-reset handshake would.
+        totals = None
         try:
-            ipc.publish_encoders(encoders.raw_totals())
+            totals = encoders.raw_totals()
+            ipc.publish_encoders(totals)
         except Exception as exc:                                # noqa: BLE001
             ipc.log("sensors", f"encoder publish failed: {exc}")
+
+        # -- standstill: the gyro's integration gate -------------------------
+        # Fed from the same totals that were just published, at this loop's
+        # rate rather than the gyro's. The gyro only ever READS the resulting
+        # flag (a plain attribute), so it never blocks its 50 Hz thread on this
+        # one.
+        if standstill is not None and totals is not None:
+            try:
+                standstill.update(totals)
+            except Exception as exc:                            # noqa: BLE001
+                ipc.log("sensors", f"standstill update failed: {exc}")
 
         # -- gyro yaw -------------------------------------------------------
         if gyro is not None:
             try:
                 yaw, connected, sample_ts = gyro.sample()
                 ipc.publish_gyro(yaw, connected, sample_ts)
+                # Hand the measured rate back to the detector. This is the
+                # safety valve for an in-place turn, where the wheels scrub
+                # sideways and may register far fewer counts than the rotation
+                # deserves -- without it, a slow spin could be mistaken for
+                # standstill and have its rotation discarded.
+                if standstill is not None and prev_yaw is not None \
+                        and sample_ts > prev_yaw_ts:
+                    standstill.note_gyro_rate(
+                        (yaw - prev_yaw) / (sample_ts - prev_yaw_ts))
+                if sample_ts != prev_yaw_ts:
+                    prev_yaw, prev_yaw_ts = yaw, sample_ts
             except Exception as exc:                            # noqa: BLE001
                 ipc.log("sensors", f"gyro publish failed: {exc}")
 
@@ -323,6 +372,12 @@ def _publish_loop(ipc: ipc_mod.IPC, config, encoders, gyro, line) -> None:
         if line is not None and tick % line_every == 0:
             try:
                 ipc.publish_line(line.read())
+            except Exception:                                   # noqa: BLE001
+                pass
+
+        if standstill is not None:
+            try:
+                ipc.publish_standstill(standstill.telemetry())
             except Exception:                                   # noqa: BLE001
                 pass
 
