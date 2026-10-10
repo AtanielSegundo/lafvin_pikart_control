@@ -337,7 +337,7 @@ class SlipConfig:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class StandstillConfig:
-    enabled: bool = True
+    enabled: bool = False
 
     # Total counts (summed over all four motors, absolute) within the window
     # below that still counts as "not moving". Not zero: a wheel resting
