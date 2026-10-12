@@ -113,6 +113,12 @@ DEFAULT_LEVELS = "750:2500:250"
 SPINUP_S       = 0.7      # tau of a free wheel is ~0.1-0.2 s; 0.7 s is settled
 WINDOW_S       = 2.0      # rate-fit window: ~20 control snapshots at 10 Hz
 REST_S         = 0.4      # brake between points so each starts from rest
+# Gearbox friction drops as the motors warm: in the second run the same motor
+# at the same duty read 4-12% faster in the verification than in the sweep
+# minutes earlier, most at low duty, where friction is a bigger share. So
+# everything spins (both directions) before anything is measured.
+WARMUP_S       = 120.0
+WARMUP_DUTY    = 1250
 FIT_SPAN       = 750      # fit the top 750 duty of the range all motors share
 REFERENCE      = ("m1", "fwd")
 MOVING_RPS     = 0.05     # wheel rev/s below which the motor counts as stopped
@@ -263,8 +269,24 @@ class TelemetryStream:
             return self._samples[-1] if self._samples else None
 
     def between(self, t0: float, t1: float) -> List[Sample]:
+        """Samples TAKEN between laptop times t0 and t1.
+
+        Not selected by arrival time: after a WiFi stall a backlog of
+        snapshots taken during spin-up -- or before the motor started -- lands
+        inside the window and drags the fitted rate down (the first runs' n>20
+        points were the low ones). The window is mapped onto the Pi's clock
+        instead: the smallest (arrival - t_pi) seen recently is the clock
+        offset plus the shortest network delay.
+        """
         with self._lock:
-            return [s for s in self._samples if t0 <= s.t_local <= t1]
+            samples = list(self._samples)
+        if not samples:
+            return []
+        # control_ts and the broadcast ts are different clocks; never mix them.
+        kind = samples[-1].precise
+        samples = [s for s in samples if s.precise == kind]
+        offset = min(s.t_local - s.t_pi for s in samples)
+        return [s for s in samples if t0 <= s.t_pi + offset <= t1]
 
     def wait_first(self, timeout: float) -> Optional[Sample]:
         end = time.monotonic() + timeout
@@ -477,6 +499,30 @@ def flag_limits(points: List[Point], max_rps: float) -> None:
                 hit = True
             else:
                 prev = p.rps
+
+
+def warm_up(kart, args) -> None:
+    """All four motors at +/-warmup_duty for ``args.warmup`` seconds, reversing
+    every 15 s (braking in between), so the sweep starts on warm gearboxes."""
+    if args.warmup <= 0:
+        return
+    print(f"[warmup] all motors at +/-{args.warmup_duty} for "
+          f"{args.warmup:.0f} s (--warmup 0 skips)")
+    end = time.monotonic() + args.warmup
+    sign = 1
+    try:
+        while (left := end - time.monotonic()) > 0:
+            d = sign * args.warmup_duty
+            if not kart.motors([d, d, d, d]):
+                print("  [ERROR] kart not reachable, warm-up cut short")
+                return
+            print(f"  {d:+d}   {left:4.0f} s left")
+            time.sleep(min(15.0, left))
+            kart.stop()
+            time.sleep(0.5)                 # brake before reversing
+            sign = -sign
+    finally:
+        kart.stop()
 
 
 def sweep(kart, stream, args, out: List[Point]) -> None:
@@ -752,7 +798,35 @@ def summarize_verification(points: List[Point]) -> Optional[dict]:
               f"{fmt(row['cw_raw']):>8} {fmt(row['cw_cor']):>8} | "
               f"{'n/a' if sr is None else f'{sr:.1f}%':>12} -> "
               f"{'n/a' if sc is None else f'{sc:.1f}%':<11}")
+
+    rep = repeatability(points)
+    if rep:
+        summary["repeatability_pct"] = rep
+        print(f"repeatability: the verification's raw readings differ from the "
+              f"sweep's (same motor, same duty) by {rep['mean']:.1f}% on "
+              f"average, worst {rep['worst']:+.1f}% ({rep['where']}).\n"
+              f"  The corrected imbalance cannot get reliably below that.")
     return summary
+
+
+def repeatability(points: List[Point]) -> Optional[dict]:
+    """How much the same motor at the same duty moved between the sweep and
+    the verification minutes later -- the noise floor of the whole method."""
+    sweep_rps: Dict[tuple, List[float]] = {}
+    for p in points:
+        if p.phase == "sweep" and p.tag and not p.note:
+            sweep_rps.setdefault((p.slot, p.duty), []).append(p.rps)
+    diffs = []
+    for p in points:
+        ref = sweep_rps.get((p.slot, p.duty))
+        if p.phase == "verify_raw" and p.tag and not p.note and ref:
+            diffs.append(((p.rps / statistics.fmean(ref) - 1.0) * 100.0,
+                          f"{p.slot} {p.duty:+d}"))
+    if not diffs:
+        return None
+    worst = max(diffs, key=lambda d: abs(d[0]))
+    return {"mean": round(statistics.fmean(abs(d) for d, _ in diffs), 2),
+            "worst": round(worst[0], 2), "where": worst[1]}
 
 
 # ---------------------------------------------------------------------------
@@ -812,6 +886,10 @@ def main() -> None:
     ap.add_argument("--spinup", type=float, default=SPINUP_S)
     ap.add_argument("--window", type=float, default=WINDOW_S)
     ap.add_argument("--rest", type=float, default=REST_S)
+    ap.add_argument("--warmup", type=float, default=WARMUP_S,
+                    help=f"seconds of warm-up spin before the sweep "
+                         f"(default {WARMUP_S:g}, 0 skips)")
+    ap.add_argument("--warmup-duty", type=int, default=WARMUP_DUTY)
     ap.add_argument("--max-rps", type=float, default=MAX_RPS,
                     help="wheel rev/s above which encoder readings are not "
                          f"trusted (default {MAX_RPS})")
@@ -866,8 +944,9 @@ def main() -> None:
     print(f"kart {args.ip}:{args.port}   battery {first.battery} V")
     print(f"levels {args.levels}  x2 directions  x{len(SLOTS)} motors  "
           f"x{args.repeats} -> at most {n_sweep} points (+{n_verify} verify), "
-          f"<= {(n_sweep + n_verify) * per_point / 60:.0f} min -- each motor "
-          f"stops at its encoder limit ({args.max_rps:g} rev/s)")
+          f"<= {((n_sweep + n_verify) * per_point + args.warmup) / 60:.0f} min "
+          f"incl. warm-up -- each motor stops at its encoder limit "
+          f"({args.max_rps:g} rev/s)")
     input("\nKart SUSPENDED, all wheels free? Enter to start (Ctrl+C aborts)... ")
 
     kart = Kart(args.ip, args.port)
@@ -876,6 +955,7 @@ def main() -> None:
     points: List[Point] = []
     params = None
     try:
+        warm_up(kart, args)
         sweep(kart, stream, args, points)
         params = build_params(points, args)
         if params is not None:

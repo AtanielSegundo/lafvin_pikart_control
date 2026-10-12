@@ -121,10 +121,11 @@ TS            = 1.0 / FS
 # This is a WARNING threshold, calibrated from the runs where the pathologies
 # start: treat a run that exceeds it as unfittable, not as merely noisy.
 #
-# Note also GLITCH_FILTER_US = 100 in encoders.py: it discards any level that
-# does not persist 100 us. At 0.7 m/s the mean edge spacing on one phase is
-# 249 us, so an encoder with an asymmetric duty cycle loses real edges there
-# too -- a second, independent undercount that grows with speed.
+# Note also GLITCH_FILTER_US in encoders.py: it discards any level that does
+# not persist that long. At the old 100 us, with 0.7 m/s giving a mean edge
+# spacing of 249 us on one phase, an encoder with an asymmetric duty cycle lost
+# real edges too -- a second, independent undercount that grew with speed. It
+# is 20 us now; runs recorded before that change still carry it.
 ENC_MAX_CPS   = 20000.0
 
 # The ultrasonic is a SAFETY INTERLOCK ONLY -- it aborts a run when the wall gets
