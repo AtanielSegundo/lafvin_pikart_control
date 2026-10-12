@@ -73,7 +73,7 @@ class GyroMPU:
                  fn_to_check_kart_movement : Optional[Callable[[],bool]] = None 
                 ):
 
-        self.sample_rate = max(1.0, float(sample_rate))
+        self.sample_rate         = max(1.0, float(sample_rate))
         self._period             = 1.0 / self.sample_rate
         self.comp_alpha          = comp_alpha
         self.yaw_axis            = yaw_axis

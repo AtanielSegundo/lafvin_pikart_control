@@ -368,8 +368,10 @@ def run(ipc: ipc_mod.IPC, config=CONFIG) -> None:
         gyro = ipc_mod.SharedGyroReader(ipc, config=config)
         guard = ipc_mod.SharedFrontGuard(ipc, config=config)
 
+        from motor_correction import load_calibration
         drive = DriveController(motor, encoders, config,
-                                guard=guard, gyro=gyro)
+                                guard=guard, gyro=gyro,
+                                motor_calibration=load_calibration())
         applier = ControlApplier(drive, motor, servo, ipc, config)
 
         def telemetry_sink(snapshot: dict) -> None:

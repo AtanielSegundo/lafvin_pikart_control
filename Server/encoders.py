@@ -36,8 +36,16 @@ except Exception:
     pigpio = None
     _PIGPIO_AVAILABLE = False
 
-# Ignore edges shorter than this (microseconds) as switch bounce / noise.
-GLITCH_FILTER_US = 100
+# Ignore levels shorter than this (microseconds) as electrical noise.
+#
+# Was 100. Hall-effect encoders do not bounce, so the filter only has to reject
+# motor-driver switching spikes, which last a few us. At 100 us it also ate REAL
+# pulses: a phase's short level is ~140 us at ~5.5 wheel rev/s, and the
+# suspended-wheel calibration (Scripts/motor_calibration.py) saw every encoder
+# -- the single-phase M3 included, at half the callbacks -- read lower, then
+# freeze, past that speed. At 20 us pulses survive to ~20 rev/s, so the
+# Python callback rate (see gray_regression ENC_MAX_CPS) is the limit again.
+GLITCH_FILTER_US = 20
 
 # {prev_state}{new_state} transition -> delta. Flattened 4x4 table.
 QUAD_TABLE = [

@@ -414,6 +414,10 @@ class Server:
         drive['stale'] = (control_ts == 0.0 or
                           (time.monotonic() - control_ts) >
                           max(0.5, 5.0 / self.config.control.loop_hz))
+        # When P_control produced this snapshot (Pi monotonic s). The broadcast
+        # "ts" can lag it by up to ~150 ms; rate estimates from the encoder
+        # totals (Scripts/motor_calibration.py) need the real sample time.
+        drive['control_ts'] = control_ts
 
         return {
             "battery": round(battery, 2),

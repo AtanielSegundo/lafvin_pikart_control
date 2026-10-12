@@ -196,8 +196,8 @@ are counted (x4). The transition delta is looked up by
 Counting is serviced by the **pigpio daemon (pigpiod)** in C. 
 This matters: at 2340 counts/rev (13 PPR × 45:1 × 4) the edge rate
 at speed is far too high for RPi.GPIO's Python callbacks, which silently under-count. 
-Each phase gets a 100 µs hardware glitch filter for
-debounce. Off-Pi (no pigpio/pigpiod), `WheelEncoders` falls back to
+Each phase gets a 20 µs hardware glitch filter against
+electrical noise (100 µs dropped real pulses above ~5.5 wheel rev/s). Off-Pi (no pigpio/pigpiod), `WheelEncoders` falls back to
 `SimulatedEncoder` so the stack still imports and the tests run.
 
 > Requires the daemon:  **`sudo pigpiod`** (start on boot with

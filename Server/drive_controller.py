@@ -42,6 +42,7 @@ import math
 
 from config import CONFIG, RobotConfig
 from kinematics import SkidSteerKinematics, Twist, WheelSpeeds
+from motor_correction import correct_duties
 from odometry import Pose, SkidSteerOdometry, wrap_angle
 from pid import PID
 from slip import SlipDetector
@@ -141,12 +142,17 @@ class DriveController:
                  clock: Callable[[], float] = time.monotonic,
                  guard=None,
                  gyro: "Optional[GyroMPU]" = None,
-                 plant: "Optional[SimulatedDrivePlant]" = None):
+                 plant: "Optional[SimulatedDrivePlant]" = None,
+                 motor_calibration: Optional[dict] = None):
         self.motor       = motor
         self.encoders    = encoders
         self.config      = config
         self._clock      = clock
         self.plant       = plant
+        # Per-motor PWM correction (motor_correction.py) for the gyro turn, so
+        # all four wheels spin at m1's speed and the turn stays centred. None =
+        # uncorrected; P_control loads it, tests leave it out.
+        self.motor_calibration = motor_calibration
         # Front collision guard: anything exposing ``engaged() -> bool`` and a
         # ``distance_cm`` property. In P_control that is ipc.SharedFrontGuard,
         # fed by P_sensors; None (tests, sim) means never engaged.
@@ -708,8 +714,11 @@ class DriveController:
             if self._front_blocked(duty_left, duty_right):
                 duty_left = duty_right = 0.0
                 guard_blocked = True
-            self.motor.setMotorModel(int(round(duty_left)), int(round(duty_left)),
-                                     int(round(duty_right)), int(round(duty_right)))
+            # duty_left/right stay in m1-forward units (telemetry, plant); each
+            # motor gets the duty that matches m1's speed at that command.
+            self.motor.setMotorModel(*correct_duties(
+                duty_left, duty_left, duty_right, duty_right,
+                self.motor_calibration))
 
         else:
             # --- VELOCITY control (teleop / `drive`) ---
