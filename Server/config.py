@@ -91,10 +91,10 @@ class PIDGains:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class PositionGains:
-    kp: float = 4000.0      # duty per metre of error
-    ki: float = 2000.0       # gentle backstop for residual error; its
+    kp: float = 3232.0      # duty per metre of error
+    ki: float = 841.06       # gentle backstop for residual error; its
                              # contribution is bounded by integral_limit below
-    kd: float = 1600.0       # duty per (m/s) — damping
+    kd: float = 359.38       # duty per (m/s) — damping
     output_limit  : float = 2200.0  # CRUISE duty cap. Keep within the rate the
                                     # encoders can count -- at high duty (~3000)
                                     # the wheel spins faster than the quadrature
@@ -111,7 +111,7 @@ class PositionGains:
     # approach slows smoothly (v ~ sqrt(2*a*d)) instead of charging in at cruise
     # duty and overshooting. Also keeps the final approach slow enough for the
     # encoders. With output_limit 2000 this starts decelerating ~0.44 m out.
-    decel_gain    : float = 3000.0
+    decel_gain    : float = 7448.3
 
 
 # ---------------------------------------------------------------------------
@@ -135,10 +135,10 @@ class PositionGains:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class HeadingGains:
-    kp: float = 4600.12 # 9308.24 / 2      # duty per rad of heading error
-    ki: float = 1890.85 # 10359.7 / 2    # gentle backstop for a residual degree or two;
+    kp: float = 2972.7 # 9308.24 / 2      # duty per rad of heading error
+    ki: float = 16240 # 10359.7 / 2    # gentle backstop for a residual degree or two;
                               # bounded by integral_limit below
-    kd: float = 1654.4        # duty per (rad/s) -- damping. THE anti-overshoot
+    kd: float = 978.17        # duty per (rad/s) -- damping. THE anti-overshoot
                               # term: raise it if the kart still swings past,
                               # lower it if the turn crawls or judders. It is
                               # deliberately large -- it has to command REVERSE
@@ -148,7 +148,7 @@ class HeadingGains:
     integral_limit: float = 800.0
     # Deceleration ceiling, same idea as PositionGains.decel_gain: cap |duty| at
     # decel_gain*sqrt(|err|) so the approach follows w ~ sqrt(2*a*theta).
-    decel_gain    : float = 2200.0
+    decel_gain    : float = 5760.2
     min_turn_duty : float = 1600.0
     pulse_floor   : bool  = True
     tolerance     : float = 0.005236 # 0.0017453293 # 0.1 deg
@@ -246,10 +246,10 @@ MOTOR_CHANNELS = {
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class ControlConfig:
-    loop_hz                  : float = 20.0
-    telemetry_hz             : float = 10.0
+    loop_hz                  : float = 25.0
+    telemetry_hz             : float = 15.0
     command_timeout          : float = 0.1   # s; stop motors if no drive cmd arrives
-    minimum_front_distance_cm: int   = 10    # front guard trips below this (cm)
+    minimum_front_distance_cm: int   = 5    # front guard trips below this (cm)
     front_distance_ttl_s     : float = 0.5   # drop the REPORTED distance after
                               # this long with no valid reading
     max_linear : float = 0.6  # m/s, saturates drive commands
