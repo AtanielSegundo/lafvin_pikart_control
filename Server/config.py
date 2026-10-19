@@ -89,12 +89,39 @@ class PIDGains:
 #   - output_limit caps how hard a move pushes, so moves are gentle & safe.
 # These MUST be tuned on hardware once the encoders are calibrated.
 # ---------------------------------------------------------------------------
+
+# Mpp = 5%
+
+# Dx  = 0.1, Ts = 2, Tr = 1 | KP   = 19392.0, KI = 1687.8, KD = 191.7, DECEL_GAIN = 3886.8
+
+# Mpp = 1%
+# Dx  = 0.3, Ts = 2, Tr = 1.5 | KP = 3232.0, KI = 841.06, KD = 359.38, DECEL_GAIN = 7448.3
+
+# Mpp = 1%
+# Dx  = 0.6, Ts = 6, Tr = 4 | KP   = 4012.5, KI = 810.46, KD = 773.62, DECEL_GAIN = 5016.6
+
+# Mpp = 1%
+# TODO: INFER PARAMS FOR THIS
+# Dx  = 0.9, Ts = 8, Tr = 6 | KP   = 3232.0, KI = 841.06, KD = 359.38, DECEL_GAIN = 7448.3
+
 @dataclass(frozen=True)
 class PositionGains:
-    kp: float = 3232.0      # duty per metre of error
-    ki: float = 841.06       # gentle backstop for residual error; its
-                             # contribution is bounded by integral_limit below
-    kd: float = 359.38       # duty per (m/s) — damping
+    
+    # duty per metre of error
+    kp: Dict[float,float] = field(default_factory=lambda: 
+        {0.1: 19392.0, 0.3: 3232.0, 0.6: 4012.5, 0.9: 3232.0}
+    )
+    
+    # gentle backstop for residual error; its contribution is bounded by integral_limit below
+    ki: Dict[float,float] = field(default_factory=lambda: 
+        {0.1: 1687.8, 0.3: 841.06, 0.6: 810.46, 0.9: 841.06}
+    )
+    
+    # duty per (m/s) — damping
+    kd: Dict[float,float] = field(default_factory=lambda: 
+        {0.1: 191.7, 0.3: 359.38, 0.6: 773.62, 0.9: 359.38}
+    )
+    
     output_limit  : float = 2200.0  # CRUISE duty cap. Keep within the rate the
                                     # encoders can count -- at high duty (~3000)
                                     # the wheel spins faster than the quadrature
@@ -111,8 +138,39 @@ class PositionGains:
     # approach slows smoothly (v ~ sqrt(2*a*d)) instead of charging in at cruise
     # duty and overshooting. Also keeps the final approach slow enough for the
     # encoders. With output_limit 2000 this starts decelerating ~0.44 m out.
-    decel_gain    : float = 7448.3
+    decel_gain    : Dict[float,float] = field(default_factory=lambda:
+        {0.1: 3886.8, 0.3: 7448.3, 0.6: 5016.6, 0.9: 7448.3}
+    )
 
+    def __post_init__(self):
+        # The four schedules are indexed together, so a breakpoint missing from
+        # one of them would only surface as a KeyError mid-move.
+        keys = [set(getattr(self, n)) for n in SCHEDULED_POSITION_FIELDS]
+        if not keys[0] or any(k != keys[0] for k in keys):
+            raise ValueError("PositionGains: kp, ki, kd and decel_gain must "
+                             "share the same non-empty set of breakpoints")
+
+
+# PositionGains fields scheduled by move distance ({breakpoint_m: value}).
+SCHEDULED_POSITION_FIELDS = ("kp", "ki", "kd", "decel_gain")
+
+
+def position_breakpoint(distance: float, breakpoints) -> float:
+    """The breakpoint whose gains serve a move of ``distance`` metres.
+
+    The smallest breakpoint >= |distance|; moves longer than the largest
+    breakpoint use the largest one.
+    """
+    d = abs(distance)
+    ordered = sorted(breakpoints)
+    return next((b for b in ordered if d <= b), ordered[-1])
+
+
+kp_t : TypeAlias = float ; ki_t : TypeAlias = float ; kd_t : TypeAlias = float ; decel_gain_t : TypeAlias = float
+def index_postion_gains_by_distance(distance:float,gains:PositionGains) -> Tuple[kp_t, ki_t, kd_t, decel_gain_t]:
+    """Pick (kp, ki, kd, decel_gain) for a move of ``distance`` metres."""
+    key = position_breakpoint(distance, gains.kp)
+    return gains.kp[key], gains.ki[key], gains.kd[key], gains.decel_gain[key]
 
 # ---------------------------------------------------------------------------
 # Turn-in-place closed on the MPU6050 gyro yaw. Error is in RADIANS of heading,

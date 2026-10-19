@@ -13,6 +13,10 @@ frozen dataclasses, and the control loop consumes them in TWO different ways:
 So a handler that only replaces the config would appear to work (the telemetry
 would show the new numbers) while changing nothing about the terms that matter
 most. Several tests below exist purely to catch that.
+
+PositionGains kp/ki/kd/decel_gain are also scheduled by move distance
+({breakpoint_m: value}). On the wire they are flat keys -- ``kp@0.3`` for one
+breakpoint, plain ``kp`` for all of them.
 """
 import math
 import os
@@ -83,11 +87,19 @@ class GainsFixture(unittest.TestCase):
                 return found
             time.sleep(0.01)
 
+    def assertSchedule(self, field, expected):
+        """Every breakpoint of position.<field> equals `expected` -- a number
+        for all of them, or a {breakpoint: value} dict."""
+        schedule = getattr(self.config.position, field)
+        if not isinstance(expected, dict):
+            expected = {bp: expected for bp in schedule}
+        self.assertEqual(schedule, expected)
+
 
 class TestPositionGains(GainsFixture):
     def test_config_is_replaced(self):
         self.apply("position", {"kp": 7777.0})
-        self.assertEqual(self.config.position.kp, 7777.0)
+        self.assertSchedule("kp", 7777.0)
 
     def test_live_pids_are_patched_too(self):
         """The one that matters: kp/ki/kd were copied into the PIDs at
@@ -139,6 +151,98 @@ class TestPositionGains(GainsFixture):
                          "a 5 cm move did not finish inside a 25 cm tolerance")
 
 
+class TestPositionSchedule(GainsFixture):
+    def setUp(self):
+        super().setUp()
+        self.bps = sorted(self.config.position.kp)
+        self.short, self.long = self.bps[0], self.bps[-1]
+
+    def test_one_breakpoint_changes_alone(self):
+        before = dict(self.config.position.kp)
+        self.apply("position", {f"kp@{self.long:g}": 5555.0})
+        self.assertSchedule("kp", {**before, self.long: 5555.0})
+
+    def test_plain_then_breakpoint_in_one_payload(self):
+        self.apply("position", {f"kp@{self.long:g}": 5555.0, "kp": 1111.0})
+        expected = {bp: 1111.0 for bp in self.bps}
+        expected[self.long] = 5555.0
+        self.assertSchedule("kp", expected)
+
+    def test_retune_does_not_touch_the_previous_schedule(self):
+        """dataclasses.replace shares unchanged dicts with the old instance;
+        the handler must copy rather than edit in place."""
+        old = self.config.position
+        snapshot = dict(old.kp)
+        self.apply("position", {f"kp@{self.short:g}": 4242.0})
+        self.assertEqual(old.kp, snapshot)
+
+    def test_a_move_loads_its_own_breakpoint(self):
+        self.apply("position", {f"kp@{self.short:g}": 1000.0,
+                                f"ki@{self.short:g}": 10.0,
+                                f"kp@{self.long:g}": 9000.0,
+                                f"ki@{self.long:g}": 90.0})
+        self.drive.drive_distance(self.short / 2)
+        self.assertEqual(self.drive.pos_left.kp, 1000.0)
+        self.assertEqual(self.drive.pos_right.ki, 10.0)
+        self.drive.release()
+        self.drive.drive_distance(self.long * 2)      # beyond the last one
+        self.assertEqual(self.drive.pos_left.kp, 9000.0)
+        self.assertEqual(self.drive.pos_right.ki, 90.0)
+
+    def test_reverse_move_uses_the_magnitude(self):
+        self.apply("position", {f"kp@{self.short:g}": 1234.0})
+        self.drive.drive_distance(-self.short / 2)
+        self.assertEqual(self.drive.pos_left.kp, 1234.0)
+
+    def test_retune_in_flight_reaches_only_the_active_breakpoint(self):
+        self.drive.drive_distance(self.long)
+        self.apply("position", {f"kp@{self.short:g}": 1.0})
+        self.assertEqual(self.drive.pos_left.kp, self.config.position.kp[self.long],
+                         "a retune of another breakpoint changed the live PID")
+        self.apply("position", {f"kp@{self.long:g}": 6543.0})
+        self.assertEqual(self.drive.pos_left.kp, 6543.0)
+
+    def test_decel_gain_follows_the_breakpoint(self):
+        """decel_gain is read live per tick; a ~0 ceiling on the active
+        breakpoint must pin the duty near 0, the same on another must not."""
+        dt = 1.0 / self.config.control.loop_hz
+        self.apply("position", {"min_move_duty": 0.0,
+                                f"decel_gain@{self.short:g}": 1.0})
+        self.drive.drive_distance(self.long)
+        self.drive.step(dt)
+        self.assertGreater(abs(self.motor.last[0]), 10)
+
+        self.drive.release()
+        self.drive.drive_distance(self.short)
+        self.drive.step(dt)
+        self.assertLessEqual(abs(self.motor.last[0]), 1)
+
+    def test_unknown_breakpoint_is_refused(self):
+        before = dict(self.config.position.kp)
+        self.apply("position", {"kp@0.33": 1.0})
+        self.assertSchedule("kp", before)
+        self.assertTrue(any("no such breakpoint" in m
+                            for m in self.logs("no such breakpoint")))
+
+    def test_breakpoint_on_a_scalar_field_is_refused(self):
+        before = self.config.heading.kp
+        self.apply("heading", {"kp@0.3": 1.0})
+        self.assertEqual(self.config.heading.kp, before)
+        self.assertTrue(any("not distance-scheduled" in m
+                            for m in self.logs("not distance-scheduled")))
+
+    def test_breakpoint_value_is_range_checked(self):
+        before = dict(self.config.position.kp)
+        self.apply("position", {f"kp@{self.short:g}": 99999.0})
+        self.assertSchedule("kp", before)
+
+    def test_mismatched_breakpoints_are_rejected_at_construction(self):
+        from config import PositionGains
+        with self.assertRaises(ValueError):
+            PositionGains(kp={0.1: 1.0}, ki={0.2: 1.0},
+                          kd={0.1: 1.0}, decel_gain={0.1: 1.0})
+
+
 class TestHeadingGains(GainsFixture):
     def test_config_and_pid_are_both_updated(self):
         self.apply("heading", {"kp": 4321.0, "output_limit": 999.0})
@@ -147,11 +251,12 @@ class TestHeadingGains(GainsFixture):
         self.assertEqual(self.drive.heading_pid.output_limit, 999.0)
 
     def test_position_and_heading_are_independent(self):
-        before = self.config.position.kp
+        before = dict(self.config.position.kp)
+        pid_before = self.drive.pos_left.kp
         self.apply("heading", {"kp": 1111.0})
         self.assertEqual(self.config.position.kp, before,
                          "tuning heading moved the position gains")
-        self.assertEqual(self.drive.pos_left.kp, before)
+        self.assertEqual(self.drive.pos_left.kp, pid_before)
 
     def test_bool_field_round_trips(self):
         self.apply("heading", {"pulse_floor": 0})
@@ -174,12 +279,12 @@ class TestValidation(GainsFixture):
                             for m in self.logs("unknown section")))
 
     def test_unknown_field_is_refused_and_named(self):
-        before = self.config.position.kp
+        before = dict(self.config.position.kp)
         self.apply("position", {"kp": 5000.0, "bogus_field": 1.0})
-        self.assertEqual(self.config.position.kp, 5000.0, "good field dropped")
+        self.assertSchedule("kp", 5000.0)
         self.assertTrue(any("bogus_field" in m
                             for m in self.logs("bogus_field")))
-        self.assertNotEqual(before, 5000.0)
+        self.assertNotEqual(set(before.values()), {5000.0})
 
     def test_out_of_range_is_refused(self):
         before = self.config.position.output_limit
@@ -199,7 +304,7 @@ class TestValidation(GainsFixture):
         """Partial application on purpose: refusing the whole payload because
         one box was mistyped would make the table frustrating to use."""
         self.apply("position", {"kp": 8000.0, "output_limit": 99999.0})
-        self.assertEqual(self.config.position.kp, 8000.0)
+        self.assertSchedule("kp", 8000.0)
         self.assertNotEqual(self.config.position.output_limit, 99999.0)
 
     def test_empty_payload_is_a_no_op(self):
@@ -226,16 +331,21 @@ class TestValidation(GainsFixture):
             gains = getattr(self.config, section)
             for field, (lo, hi) in \
                     proc_control.ControlApplier.GAIN_LIMITS[section].items():
-                value = float(getattr(gains, field))
-                self.assertTrue(lo <= value <= hi,
-                                f"{section}.{field} default {value:g} is "
-                                f"outside [{lo:g}, {hi:g}]")
+                value = getattr(gains, field)
+                entries = (value.items() if isinstance(value, dict)
+                           else [(None, value)])
+                for bp, v in entries:
+                    where = field if bp is None else f"{field}@{bp:g}"
+                    self.assertTrue(lo <= float(v) <= hi,
+                                    f"{section}.{where} default {float(v):g} "
+                                    f"is outside [{lo:g}, {hi:g}]")
 
 
 class TestTelemetry(GainsFixture):
     def test_gains_serialise_to_plain_scalars(self):
         payload = proc_control.gains_as_dict(self.config.position)
-        self.assertIn("kp", payload)
+        bp = min(self.config.position.kp)
+        self.assertIn(f"kp@{bp:g}", payload)
         for key, value in payload.items():
             self.assertIsInstance(value, (int, float, bool),
                                   f"{key} is not JSON-safe: {type(value)}")
@@ -255,11 +365,26 @@ class TestTelemetry(GainsFixture):
         """The table's grey 'live' column reads these. A tunable field missing
         from the payload would render as '--' forever."""
         for section in ("position", "heading"):
-            published = set(proc_control.gains_as_dict(
-                getattr(self.config, section)))
+            published = {proc_control.split_schedule_key(k)[0]
+                         for k in proc_control.gains_as_dict(
+                             getattr(self.config, section))}
             tunable = set(proc_control.ControlApplier.GAIN_LIMITS[section])
             self.assertEqual(tunable - published, set(),
                              f"{section}: not published {tunable - published}")
+
+    def test_schedule_is_published_per_breakpoint(self):
+        payload = proc_control.gains_as_dict(self.config.position)
+        for bp, value in self.config.position.kp.items():
+            self.assertEqual(payload[f"kp@{bp:g}"], value)
+        self.assertNotIn("kp", payload)
+
+    def test_every_published_key_is_accepted_back(self):
+        """The tuner and the UI send back the keys they were shown."""
+        payload = proc_control.gains_as_dict(self.config.position)
+        self.apply("position", payload)
+        self.assertEqual(proc_control.gains_as_dict(self.config.position),
+                         payload)
+        self.assertFalse(any("rejected" in m for m in self.logs()))
 
 
 class TestRouting(unittest.TestCase):

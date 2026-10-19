@@ -40,7 +40,7 @@ from typing import Callable, Optional, TYPE_CHECKING
 
 import math
 
-from config import CONFIG, RobotConfig
+from config import CONFIG, RobotConfig, index_postion_gains_by_distance
 from kinematics import SkidSteerKinematics, Twist, WheelSpeeds
 from motor_correction import correct_duties
 from odometry import Pose, SkidSteerOdometry, wrap_angle
@@ -57,8 +57,12 @@ def _clamp(value: float, limit: float) -> float:
     return max(-limit, min(limit, value))
 
 
-def _shape_move_duty(duty: float, remaining: float, speed: float, gains) -> float:
+def _shape_move_duty(duty: float, remaining: float, speed: float, gains,
+                     decel_gain: float) -> float:
     """Shape one side's position-PID duty for a smooth, low-overshoot stop.
+
+    ``decel_gain`` is passed in rather than read from ``gains``: it is scheduled
+    by move distance, so the caller picks the entry for the active move.
 
     Two effects, sign preserved:
 
@@ -77,8 +81,8 @@ def _shape_move_duty(duty: float, remaining: float, speed: float, gains) -> floa
     if duty == 0.0:
         return 0.0
     mag = abs(duty)
-    if gains.decel_gain > 0.0:
-        mag = min(mag, gains.decel_gain * math.sqrt(max(0.0, abs(remaining))))
+    if decel_gain > 0.0:
+        mag = min(mag, decel_gain * math.sqrt(max(0.0, abs(remaining))))
     if (gains.min_move_duty > 0.0 and abs(remaining) > gains.tolerance
             and abs(speed) < gains.stop_speed):
         mag = max(mag, gains.min_move_duty)
@@ -173,11 +177,17 @@ class DriveController:
                              gains.output_limit, gains.integral_limit)
 
         # Position PIDs (drive_distance / turn): error in METRES -> duty.
+        # kp/ki/kd are scheduled by move distance: built with placeholders and
+        # loaded by apply_position_gains(), here and again at every move start.
         pg = config.position
-        self.pos_left = PID(pg.kp, pg.ki, pg.kd, 0.0,
+        self.pos_left = PID(0.0, 0.0, 0.0, 0.0,
                             pg.output_limit, pg.integral_limit)
-        self.pos_right = PID(pg.kp, pg.ki, pg.kd, 0.0,
+        self.pos_right = PID(0.0, 0.0, 0.0, 0.0,
                              pg.output_limit, pg.integral_limit)
+        # Distance the position PIDs are currently scheduled for. Until the
+        # first move that is the shortest breakpoint.
+        self._pos_schedule_distance = 0.0
+        self.apply_position_gains()
 
         # Heading PID (gyro turn-in-place): error in RADIANS of yaw -> duty.
         hg = config.heading
@@ -302,12 +312,26 @@ class DriveController:
             s = math.radians(angle_deg) * self.config.wheel.track / 2.0
             self._start_move(-s, s)
 
+    def apply_position_gains(self) -> None:
+        """Load the scheduled kp/ki/kd for the current move distance into both
+        position PIDs.
+
+        Called at every move start, and by P_control after a runtime retune so
+        a move in flight picks up the new gains for its own breakpoint.
+        """
+        kp, ki, kd, _ = index_postion_gains_by_distance(
+            self._pos_schedule_distance, self.config.position)
+        for pid in (self.pos_left, self.pos_right):
+            pid.kp, pid.ki, pid.kd = kp, ki, kd
+
     def _start_move(self, target_left: float, target_right: float) -> None:
         self.pos_left.reset()
         self.pos_right.reset()
+        move = _PositionMove(target_left, target_right, self.config.position)
+        self._pos_schedule_distance = move.distance
+        self.apply_position_gains()
         with self._lock:
-            self._move = _PositionMove(target_left, target_right,
-                                       self.config.position)
+            self._move = move
             self._heading_target = None
             self._engaged = True
 
@@ -640,11 +664,14 @@ class DriveController:
                                                move.traveled_right, dt)
             err_l, err_r = move.errors()
             # Decelerate into the target (low overshoot, encoder-safe) and floor
-            # only a side that has stalled short.
+            # only a side that has stalled short. decel_gain is read live (a
+            # retune lands on the next tick) for this move's breakpoint.
+            pg = self.config.position
+            decel = index_postion_gains_by_distance(move.distance, pg)[3]
             duty_left = _shape_move_duty(duty_left, err_l, measured.left,
-                                         self.config.position)
+                                         pg, decel)
             duty_right = _shape_move_duty(duty_right, err_r, measured.right,
-                                          self.config.position)
+                                          pg, decel)
         
             if move.is_done(measured.left, measured.right):
                 duty_left = duty_right = 0.0
@@ -952,11 +979,15 @@ class _PositionMove:
     opposite. Travel is accumulated from the encoder deltas each step; the move
     finishes when both sides are within tolerance and have stopped (or on a
     safety timeout).
+
+    ``distance`` selects the scheduled gains: the longer side's travel, which
+    for an encoder turn is the per-side arc (angle * track / 2), not the angle.
     """
 
     def __init__(self, target_left: float, target_right: float, gains):
         self.target_left = target_left
         self.target_right = target_right
+        self.distance = max(abs(target_left), abs(target_right))
         self.traveled_left = 0.0
         self.traveled_right = 0.0
         self.elapsed = 0.0

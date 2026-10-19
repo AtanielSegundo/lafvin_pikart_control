@@ -26,6 +26,13 @@ PROCEDURE
 5. The winner is applied (unless --no-apply) and printed as a config.py
    snippet: set_gains changes P_control's copy only, lost on restart.
 
+POSITION GAINS ARE SCHEDULED BY DISTANCE: PositionGains kp/ki/kd/decel_gain are
+{breakpoint_m: value} dicts, published as kp@0.3 etc. A position run tunes the
+ONE breakpoint --step falls into (the smallest breakpoint >= step, as the
+controller picks it) and leaves the others alone. Run once per breakpoint, with
+a --step inside its range. max_time is not scheduled: the winner's ts + tr
+applies to every move length.
+
 Ctrl-C once during the search: stop searching, validate what there is.
 Ctrl-C again (or any error): stop the motors, restore the live gains.
 
@@ -97,9 +104,11 @@ SERVER = os.path.join(REPO, "Server")
 if SERVER not in sys.path:
     sys.path.insert(0, SERVER)
 
+from config import position_breakpoint                           # noqa: E402
 from motor_calibration import (DEFAULT_IP, DEFAULT_PORT, Kart,  # noqa: E402
                                TelemetryStream)
-from proc_control import ControlApplier                          # noqa: E402
+from proc_control import (ControlApplier, schedule_key,          # noqa: E402
+                          split_schedule_key)
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -250,16 +259,35 @@ class Telemetry(TelemetryStream):
                       key=lambda s: s.t_pi), t0
 
 
-def fetch_live_gains(tel: Telemetry, section: str,
-                     timeout: float = 3.0) -> Optional[dict]:
-    """The gains P_control is running right now. They ride on the control
-    loop's snapshots, so the first frames after a restart may lack them."""
+def scheduled_breakpoints(gains: dict) -> List[float]:
+    """Breakpoints of the distance-scheduled gains in a telemetry gains dict
+    (keys like kp@0.3); empty for an unscheduled section (heading)."""
+    return sorted({float(bp) for name, bp in map(split_schedule_key, gains)
+                   if name in TUNABLE and bp is not None})
+
+
+def fetch_live_gains(tel: Telemetry, section: str, step: float,
+                     timeout: float = 3.0
+                     ) -> Optional[Tuple[dict, Optional[float]]]:
+    """The gains P_control is running right now, and the breakpoint `step`
+    selects (None when the section is not scheduled). Scheduled gains are
+    returned under their plain names (kp, not kp@0.3), so the search never
+    sees the schedule. They ride on the control loop's snapshots, so the first
+    frames after a restart may lack them."""
     end = time.monotonic() + timeout
     while time.monotonic() < end:
         s = tel.latest()
         g = (s.gains or {}).get(section) if s is not None else None
-        if g and all(k in g for k in (*TUNABLE, "max_time", "tolerance")):
-            return dict(g)
+        if g:
+            bps = scheduled_breakpoints(g)
+            bp = position_breakpoint(step, bps) if bps else None
+            view = dict(g)
+            if bp is not None:
+                for n in TUNABLE:
+                    view[n] = g.get(schedule_key(n, bp))
+            if all(view.get(k) is not None
+                   for k in (*TUNABLE, "max_time", "tolerance")):
+                return view, bp
         time.sleep(0.1)
     return None
 
@@ -284,13 +312,23 @@ class Rig:
     response. Knows nothing about specs or costs."""
 
     def __init__(self, mode: str, kart: TuningKart, tel: Telemetry,
-                 rest: float, tail: float, dash: "Dashboard" = None):
+                 rest: float, tail: float, dash: "Dashboard" = None,
+                 breakpoint: Optional[float] = None):
         self.mode = mode
         self.kart = kart
         self.tel = tel
         self.rest = rest
         self.tail = tail
         self.dash = dash
+        # Distance-scheduled section: the breakpoint being tuned. The search
+        # speaks plain names (kp); the wire wants kp@<breakpoint>.
+        self.breakpoint = breakpoint
+
+    def wire(self, values: dict) -> dict:
+        if self.breakpoint is None:
+            return dict(values)
+        return {(schedule_key(k, self.breakpoint) if k in TUNABLE else k): v
+                for k, v in values.items()}
 
     def wait(self, seconds: float) -> None:
         """Sleep, keeping the dashboard window responsive."""
@@ -327,6 +365,7 @@ class Rig:
     def push_gains(self, section: str, values: dict,
                    timeout: float = 3.0) -> None:
         """set_gains, then wait until telemetry shows the loop running them."""
+        values = self.wire(values)
         t_sent = time.monotonic()
         if not self.kart.set_gains(section, values):
             raise TrialError("set_gains was not acknowledged (HTTP)")
@@ -695,6 +734,7 @@ class Tuner:
         self.args = args
         self.rig = rig
         self.section = args.mode
+        self.breakpoint = rig.breakpoint      # None unless scheduled
         self.unit = UNIT[args.mode]
         self.live = live                      # the restore point
         self.spec = Spec(args.ts, args.tr, args.mpp)
@@ -891,9 +931,16 @@ class Tuner:
                       if self.args.no_apply else
                       "Applied to the running kart -- lost on restart."))
         cls = "HeadingGains" if self.section == "heading" else "PositionGains"
-        print(f"To keep it, Server/config.py -> {cls}:")
-        for n in TUNABLE:
-            print(f"    {n:<14}: float = {w.params[n]:.6g}")
+        if self.breakpoint is None:
+            print(f"To keep it, Server/config.py -> {cls}:")
+            for n in TUNABLE:
+                print(f"    {n:<14}: float = {w.params[n]:.6g}")
+        else:
+            bp = self.breakpoint
+            print(f"To keep it, Server/config.py -> {cls}, the {bp:g} entry "
+                  f"of each schedule:")
+            for n in TUNABLE:
+                print(f"    {n:<14}: {{..., {bp:g}: {w.params[n]:.6g}, ...}}")
         print(f"    {'max_time':<14}: float = {self.max_time:g}")
 
     def save_json(self, path: str) -> None:
@@ -915,6 +962,7 @@ class Tuner:
         a = self.args
         out = {
             "mode": self.section, "unit": self.unit, "step": self.r,
+            "breakpoint": self.breakpoint,
             "spec": {"ts": a.ts, "tr": a.tr, "mpp": a.mpp},
             "max_time": self.max_time, "band_pct": a.band,
             "drift_tol": self.drift_tol, "drift_unit": self.drift_unit,
@@ -1294,12 +1342,19 @@ def main(argv=None) -> int:
               f"is web.py running?")
         tel.close()
         return 1
-    live = fetch_live_gains(tel, args.mode)
-    if live is None:
+    fetched = fetch_live_gains(tel, args.mode, args.step)
+    if fetched is None:
         print(f"[ERROR] telemetry carries no '{args.mode}' gains -- server "
               f"older than the tuning table?")
         tel.close()
         return 1
+    live, bp = fetched
+    if bp is not None:
+        bps = scheduled_breakpoints(live)
+        lower = max((b for b in bps if b < bp), default=0.0)
+        upper = "" if bp < bps[-1] else " and longer"
+        print(f"--step {args.step:g} m tunes the {bp:g} m breakpoint (moves "
+              f"{lower:g} < d <= {bp:g} m{upper}); the others are untouched")
     print(f"live {args.mode} gains: " + ", ".join(
         f"{k}={live[k]:g}" for k in (*TUNABLE, "max_time")))
 
@@ -1311,7 +1366,7 @@ def main(argv=None) -> int:
 
     dash = None if args.no_plot else Dashboard(title)
     rig = Rig(args.mode, TuningKart(args.ip, args.port), tel, args.rest,
-              args.tail, dash)
+              args.tail, dash, breakpoint=bp)
     log = TrialLog(base + ".csv")
     tuner = Tuner(args, rig, live, dash, log)
     try:

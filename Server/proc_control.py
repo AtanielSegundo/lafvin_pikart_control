@@ -32,6 +32,17 @@ import protocol
 from protocol import Command
 
 
+def schedule_key(name: str, breakpoint: float) -> str:
+    """Flat key for one entry of a distance-scheduled gain: ``kp@0.3``."""
+    return f"{name}@{breakpoint:g}"
+
+
+def split_schedule_key(key: str):
+    """``kp@0.3`` -> ("kp", "0.3"); a plain ``kp`` -> ("kp", None)."""
+    name, sep, bp = key.partition("@")
+    return name, (bp if sep else None)
+
+
 def gains_as_dict(gains) -> dict:
     """A gains dataclass as plain JSON-safe scalars.
 
@@ -40,6 +51,10 @@ def gains_as_dict(gains) -> dict:
     the gains living in P_control and editable at runtime, the browser's idea
     of them and the loop's can diverge -- and a tuning table that lies about
     the current value is worse than none.
+
+    A distance-scheduled field ({breakpoint_m: value}) is flattened to one key
+    per breakpoint (``kp@0.1``, ``kp@0.3``, ...), so every value stays a scalar
+    and the same key round-trips through set_gains.
     """
     import dataclasses
     out = {}
@@ -49,6 +64,9 @@ def gains_as_dict(gains) -> dict:
             out[field.name] = value
         elif isinstance(value, (int, float)):
             out[field.name] = round(float(value), 6)
+        elif isinstance(value, dict):
+            for bp in sorted(value):
+                out[schedule_key(field.name, bp)] = round(float(value[bp]), 6)
     return out
 
 
@@ -247,6 +265,11 @@ class ControlApplier:
 
         Only this process's copy of CONFIG is touched -- after the fork each
         process has its own, and the gains are meaningful only here.
+
+        Distance-scheduled fields (PositionGains kp/ki/kd/decel_gain) take
+        ``kp@0.3`` to set one breakpoint, or a plain ``kp`` to set them all.
+        Only existing breakpoints are accepted: a typo like ``kp@0.33`` would
+        otherwise add a breakpoint and quietly reshuffle which moves use what.
         """
         import dataclasses
 
@@ -261,10 +284,22 @@ class ControlApplier:
             self.ipc.log("control", "set_gains: no values")
             return
 
+        current = getattr(self.config, section)
         clean, rejected = {}, []
         for key, raw in values.items():
-            if key not in limits:
+            name, bp_text = split_schedule_key(key)
+            if name not in limits:
                 rejected.append(f"{key} (unknown)")
+                continue
+            schedule = getattr(current, name)
+            if isinstance(schedule, dict):
+                if bp_text is not None and bp_text not in {
+                        f"{bp:g}" for bp in schedule}:
+                    rejected.append(f"{key} (no such breakpoint; have "
+                                    f"{', '.join(f'{bp:g}' for bp in sorted(schedule))})")
+                    continue
+            elif bp_text is not None:
+                rejected.append(f"{key} ({name} is not distance-scheduled)")
                 continue
             try:
                 number = float(raw)
@@ -274,13 +309,13 @@ class ControlApplier:
             if number != number:                               # NaN
                 rejected.append(f"{key} (NaN)")
                 continue
-            lo, hi = limits[key]
+            lo, hi = limits[name]
             if not (lo <= number <= hi):
                 rejected.append(f"{key}={number:g} (outside [{lo:g}, {hi:g}])")
                 continue
-            if key in self._BOOL_FIELDS:
+            if name in self._BOOL_FIELDS:
                 clean[key] = bool(number)
-            elif key in self._INT_FIELDS:
+            elif name in self._INT_FIELDS:
                 clean[key] = int(round(number))
             else:
                 clean[key] = number
@@ -290,8 +325,23 @@ class ControlApplier:
         if not clean:
             return
 
-        current = getattr(self.config, section)
-        updated = dataclasses.replace(current, **clean)
+        # Fold the flat keys back into fields. Schedules are copied, never
+        # mutated: dataclasses.replace shares the old dict with `current`.
+        # Plain keys go first so {"kp": a, "kp@0.3": b} means "all a, 0.3 b".
+        changes = {}
+        for key, value in sorted(clean.items(),
+                                 key=lambda kv: "@" in kv[0]):
+            name, bp_text = split_schedule_key(key)
+            schedule = getattr(current, name)
+            if not isinstance(schedule, dict):
+                changes[name] = value
+                continue
+            new = changes.setdefault(name, dict(schedule))
+            for bp in new:
+                if bp_text is None or f"{bp:g}" == bp_text:
+                    new[bp] = value
+
+        updated = dataclasses.replace(current, **changes)
         object.__setattr__(self.config, section, updated)
 
         # Push into the already-built PIDs. A move or turn in flight keeps its
@@ -299,8 +349,10 @@ class ControlApplier:
         # kart lurch, and the operator retuning gains is watching the kart, not
         # asking for a discontinuity.
         if section == "position":
+            # kp/ki/kd are scheduled: reload the entry for the distance the
+            # PIDs are running (the move in flight, else the last one).
+            self.drive.apply_position_gains()
             for pid in (self.drive.pos_left, self.drive.pos_right):
-                pid.kp, pid.ki, pid.kd = updated.kp, updated.ki, updated.kd
                 pid.output_limit = updated.output_limit
                 pid.integral_limit = updated.integral_limit
         else:

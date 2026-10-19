@@ -362,7 +362,10 @@ function handleTelemetry(raw) {
   if (msg.gains) {
     if (msg.gains.position) liveGains.position = msg.gains.position;
     if (msg.gains.heading) liveGains.heading = msg.gains.heading;
-    refreshTuneValues(false);
+    // The breakpoint rows exist only once the first gains arrive.
+    const rows = tuneSection + ':' + tuneRows().map(r => r[0]).join(',');
+    if (rows !== tuneRowKeys) buildTuneGrid();
+    else refreshTuneValues(false);
   }
 }
 
@@ -757,6 +760,29 @@ const TUNE_FIELDS = {
 let tuneSection = 'position';
 let liveGains = { position: {}, heading: {} };
 const tuneDirty = new Set();          // "section.field" being edited
+let tuneRowKeys = '';                 // rows the grid was built for
+
+// Position kp/ki/kd/decel_gain are scheduled by move distance: telemetry
+// carries one key per breakpoint (kp@0.3) and each gets its own row, sent back
+// under the same key. Rows come from the live keys, so they track config.py.
+function scheduledKeys(field, values) {
+  return Object.keys(values || {})
+    .filter(k => k.startsWith(field + '@'))
+    .sort((a, b) => parseFloat(a.split('@')[1]) - parseFloat(b.split('@')[1]));
+}
+
+function tuneRows() {
+  const values = liveGains[tuneSection] || {};
+  const rows = [];
+  for (const [field, hint] of TUNE_FIELDS[tuneSection]) {
+    const keys = scheduledKeys(field, values);
+    if (!keys.length) { rows.push([field, hint]); continue; }
+    for (const key of keys) {
+      rows.push([key, hint + ' -- breakpoint ' + key.split('@')[1] + ' m']);
+    }
+  }
+  return rows;
+}
 
 function fmtGain(v) {
   if (v === undefined || v === null) return '--';
@@ -769,7 +795,9 @@ function buildTuneGrid() {
   const grid = document.getElementById('tuneGrid');
   if (!grid) return;
   grid.innerHTML = '';
-  for (const [field, hint] of TUNE_FIELDS[tuneSection]) {
+  const rows = tuneRows();
+  tuneRowKeys = tuneSection + ':' + rows.map(r => r[0]).join(',');
+  for (const [field, hint] of rows) {
     const label = document.createElement('label');
     label.textContent = field;
     label.title = hint;
@@ -797,7 +825,7 @@ function buildTuneGrid() {
 
 function refreshTuneValues(force) {
   const values = liveGains[tuneSection] || {};
-  for (const [field] of TUNE_FIELDS[tuneSection]) {
+  for (const [field] of tuneRows()) {
     const input = document.getElementById('tune_' + field);
     const live = document.getElementById('live_' + field);
     if (!input) continue;
@@ -832,7 +860,7 @@ function setTuneStatus(text, kind) {
 function applyGains() {
   const values = {};
   let count = 0;
-  for (const [field] of TUNE_FIELDS[tuneSection]) {
+  for (const [field] of tuneRows()) {
     const input = document.getElementById('tune_' + field);
     if (!input || input.value === '') continue;
     const v = Number(input.value);
@@ -864,7 +892,7 @@ function applyGains() {
 
 function revertGains() {
   tuneDirty.clear();
-  for (const [field] of TUNE_FIELDS[tuneSection]) {
+  for (const [field] of tuneRows()) {
     const input = document.getElementById('tune_' + field);
     if (input) input.classList.remove('dirty');
   }
@@ -879,6 +907,13 @@ function copyGains() {
   const cls = tuneSection === 'position' ? 'PositionGains' : 'HeadingGains';
   let out = '@dataclass(frozen=True)\nclass ' + cls + ':\n';
   for (const [field] of TUNE_FIELDS[tuneSection]) {
+    const keys = scheduledKeys(field, values);
+    if (keys.length) {
+      const entries = keys.map(k => k.split('@')[1] + ': ' + values[k]);
+      out += '    ' + field + ': Dict[float,float] = field(default_factory=lambda:\n'
+           + '        {' + entries.join(', ') + '}\n    )\n';
+      continue;
+    }
     const v = values[field];
     if (v === undefined) continue;
     if (field === 'pulse_floor') {
