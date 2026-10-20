@@ -109,17 +109,17 @@ class PositionGains:
     
     # duty per metre of error
     kp: Dict[float,float] = field(default_factory=lambda: 
-        {0.1: 19392.0, 0.3: 3232.0, 0.6: 4012.5, 0.9: 3232.0}
+        {0.1: 19392.0, 0.3: 3232.0, 0.6: 2880.8, 0.9: 19392}
     )
     
     # gentle backstop for residual error; its contribution is bounded by integral_limit below
     ki: Dict[float,float] = field(default_factory=lambda: 
-        {0.1: 1687.8, 0.3: 841.06, 0.6: 810.46, 0.9: 841.06}
+        {0.1: 1687.8, 0.3: 841.06, 0.6: 140.18, 0.9: 631}
     )
     
     # duty per (m/s) — damping
     kd: Dict[float,float] = field(default_factory=lambda: 
-        {0.1: 191.7, 0.3: 359.38, 0.6: 773.62, 0.9: 359.38}
+        {0.1: 191.7, 0.3: 359.38, 0.6: 481.2, 0.9: 2156.3}
     )
     
     output_limit  : float = 2200.0  # CRUISE duty cap. Keep within the rate the
@@ -139,7 +139,7 @@ class PositionGains:
     # duty and overshooting. Also keeps the final approach slow enough for the
     # encoders. With output_limit 2000 this starts decelerating ~0.44 m out.
     decel_gain    : Dict[float,float] = field(default_factory=lambda:
-        {0.1: 3886.8, 0.3: 7448.3, 0.6: 5016.6, 0.9: 7448.3}
+        {0.1: 3886.8, 0.3: 7448.3, 0.6: 2477, 0.9: 1241.3}
     )
 
     def __post_init__(self):
