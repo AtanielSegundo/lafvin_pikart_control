@@ -62,6 +62,7 @@ DIST_CM, DIST_GUARD, DIST_HEALTHY, DIST_TS = 0, 1, 2, 3
 ADC_BATTERY, ADC_LIGHT_L, ADC_LIGHT_R, ADC_TS = 0, 1, 2, 3
 LINE_L, LINE_M, LINE_R, LINE_VALID = 0, 1, 2, 3
 STILL_MOVING, STILL_EVENTS, STILL_FROZEN_S, STILL_TS = 0, 1, 2, 3
+STILL_WEIGHT, STILL_BIAS = 4, 5
 HB_TS, HB_DT, HB_STEPS = 0, 1, 2
 
 _NAN = float("nan")
@@ -391,7 +392,7 @@ class IPC:
         self.dist = ctx.Array("d", 4)
         self.adc = ctx.Array("d", 4)
         self.line = ctx.Array("i", 4)
-        self.standstill = ctx.Array("d", 4)
+        self.standstill = ctx.Array("d", 6)
         self.control_hb = ctx.Array("d", 3)
         self.camera_state = ctx.Array("i", 2)      # (running, refcount)
 
@@ -471,6 +472,8 @@ class IPC:
             self.standstill[STILL_MOVING] = 1.0 if state.get("moving") else 0.0
             self.standstill[STILL_EVENTS] = float(state.get("frozen_events", 0))
             self.standstill[STILL_FROZEN_S] = float(state.get("frozen_s", 0.0))
+            self.standstill[STILL_WEIGHT] = float(state.get("stillness", 0.0))
+            self.standstill[STILL_BIAS] = float(state.get("learned_bias_dps", 0.0))
             self.standstill[STILL_TS] = time.monotonic()
 
     def read_standstill(self):
@@ -480,6 +483,8 @@ class IPC:
             return {"moving": self.standstill[STILL_MOVING] >= 0.5,
                     "frozen_events": int(self.standstill[STILL_EVENTS]),
                     "frozen_s": round(self.standstill[STILL_FROZEN_S], 2),
+                    "stillness": round(self.standstill[STILL_WEIGHT], 3),
+                    "learned_bias_dps": round(self.standstill[STILL_BIAS], 5),
                     "age": round(time.monotonic() - self.standstill[STILL_TS], 2)}
 
     def publish_line(self, bits: Sequence[int]) -> None:

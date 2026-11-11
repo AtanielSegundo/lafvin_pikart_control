@@ -70,7 +70,12 @@ class GyroMPU:
                  cache_path:  str = CAL_CACHE,
                  max_reconect_tries:int = 16,
                  retry_time_ms:float = 300,   # backoff between reconnect tries
-                 fn_to_check_kart_movement : Optional[Callable[[],bool]] = None 
+                 fn_to_check_kart_movement : Optional[Callable[[],bool]] = None,
+                 # Yaw only: a standstill.ZeroRateFilter and the stillness
+                 # weight (0 moving .. 1 still) it is driven by. When given,
+                 # they replace the on/off gate above for the yaw axis.
+                 zero_rate = None,
+                 fn_stillness : Optional[Callable[[],float]] = None
                 ):
 
         self.sample_rate         = max(1.0, float(sample_rate))
@@ -84,7 +89,9 @@ class GyroMPU:
         self._retry_time         = max(0.0, retry_time_ms / 1000.0)  # s, reconnect backoff
         _safeCallable = lambda : fn_to_check_kart_movement() if (fn_to_check_kart_movement is not None) else True
         self._fn_to_check_kart_movement = _safeCallable
-        
+        self._zero_rate    = zero_rate if fn_stillness is not None else None
+        self._fn_stillness = fn_stillness
+
         # Desired sensor config, kept so a reconnect can re-apply it.
         self._accel_range = accel_range
         self._gyro_range  = gyro_range
@@ -245,6 +252,8 @@ class GyroMPU:
 
         with self._lock:
             self.gyro_bias = bias
+            if self._zero_rate is not None:
+                self._zero_rate.reset()     # the fresh bias replaces it
             self.angles = {"x": roll, "y": pitch, "z": 0.0}
             self.heading = 0.0
             self.calibrated = True
@@ -341,6 +350,20 @@ class GyroMPU:
                 gx = self.angles["x"]
                 gy = self.angles["y"]
                 gz = self.angles["z"]
+            if self._zero_rate is not None:
+                # Yaw through the zero-rate filter instead of the gate: held
+                # and bias-learning only while the wheels are still, plain
+                # integration (minus the learned bias) while they turn.
+                rate = {"x": gyro["x"] - bx, "y": gyro["y"] - by,
+                        "z": gyro["z"] - bz}[self.yaw_axis]
+                rate = self._zero_rate.step(rate, dt, self._fn_stillness())
+                new = self.angles[self.yaw_axis] + rate * dt
+                if self.yaw_axis == "x":
+                    gx = new
+                elif self.yaw_axis == "y":
+                    gy = new
+                else:
+                    gz = new
 
         # Accel gives an absolute roll/pitch reference -- but only trust it when
         # the kart isn't accelerating (|a| ~ 1 g), else linear accel corrupts it.

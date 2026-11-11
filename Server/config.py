@@ -395,7 +395,7 @@ class SlipConfig:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class StandstillConfig:
-    enabled: bool = False
+    enabled: bool = True
 
     # Total counts (summed over all four motors, absolute) within the window
     # below that still counts as "not moving". Not zero: a wheel resting
@@ -420,6 +420,28 @@ class StandstillConfig:
     # reports a rate above this, motion is assumed regardless of the encoders --
     # a safety valve against freezing during a real rotation.
     gyro_rate_floor_dps: float = 3.0
+
+    # -- zero-rate update (ZeroRateFilter in standstill.py) -----------------
+    # While the encoders are still, the gyro's yaw reading IS its bias, so the
+    # bias is re-learned there instead of trusting the start-up calibration
+    # alone: the MPU6050's bias moves as the chip warms (a parked run drifted
+    # ~1 deg/min in the first minutes after boot, ~0.5 later). The filter acts
+    # ONLY while still; with the wheels turning yaw is plain integration.
+    #
+    # After enter_quiet_s the stillness weight ramps 0 -> 1 over this long,
+    # scaling both the freeze and the bias learning in.
+    still_ramp_s: float = 1.0
+    # Time constant of the bias EMA at full stillness. Sized from the Allan
+    # deviation of a parked run (Scripts/analyze_heading_drift.py): long enough
+    # to average the rate noise down, short against the thermal wander.
+    bias_tau_s: float = 20.0
+    # A still-time rate sample further than this from the learned bias is
+    # clipped before it is learned from, so a knock on the chassis cannot drag
+    # the bias. A few times the per-sample noise; far below the gyro floor.
+    max_innovation_dps: float = 0.5
+    # Subtract the learned bias while moving too. It is the start-up
+    # calibration, refreshed -- nothing is filtered while the wheels turn.
+    apply_learned_bias: bool = True
 
 
 @dataclass(frozen=True)

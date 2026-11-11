@@ -18,7 +18,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import ENCODER_TAGS, RobotConfig, StandstillConfig  # noqa: E402
-from standstill import StandstillDetector                        # noqa: E402
+from standstill import StandstillDetector, ZeroRateFilter        # noqa: E402
 
 
 class FakeClock:
@@ -252,6 +252,88 @@ class TestGyroIntegrationGate(unittest.TestCase):
             integrate(0.02)
         self.assertAlmostEqual(angles["z"], drifted, places=9,
                                msg="integration continued while gated off")
+
+
+class TestStillness(StandstillFixture):
+    def test_zero_while_moving(self):
+        self.det.update(totals())
+        self.clock.advance(0.01)
+        self.det.update(totals(M1=100))
+        self.assertEqual(self.det.stillness(), 0.0)
+
+    def test_ramps_in_after_the_quiet_window(self):
+        cfg = self.config.standstill
+        self.det.update(totals())
+        self.quiet_for(cfg.enter_quiet_s + cfg.still_ramp_s / 2)
+        self.assertGreater(self.det.stillness(), 0.3)
+        self.assertLess(self.det.stillness(), 0.7)
+        self.quiet_for(cfg.still_ramp_s)
+        self.assertEqual(self.det.stillness(), 1.0)
+
+    def test_drops_to_zero_on_the_first_count(self):
+        """The filter must be off the moment the wheels turn."""
+        cfg = self.config.standstill
+        self.det.update(totals())
+        self.quiet_for(cfg.enter_quiet_s + cfg.still_ramp_s + 1.0)
+        self.assertEqual(self.det.stillness(), 1.0)
+        self.clock.advance(0.01)
+        self.det.update(totals(M1=cfg.count_tolerance + 1))
+        self.assertEqual(self.det.stillness(), 0.0)
+
+    def test_zero_when_disabled(self):
+        config = RobotConfig(standstill=StandstillConfig(enabled=False))
+        det = StandstillDetector(config, clock=self.clock)
+        for _ in range(500):
+            self.clock.advance(0.01)
+            det.update(totals())
+        self.assertEqual(det.stillness(), 0.0)
+
+
+class TestZeroRateFilter(unittest.TestCase):
+    def setUp(self):
+        self.config = RobotConfig()
+        self.zr = ZeroRateFilter(self.config)
+
+    def run_for(self, seconds, rate, stillness, dt=0.02):
+        angle = 0.0
+        for _ in range(int(round(seconds / dt))):
+            angle += self.zr.step(rate, dt, stillness) * dt
+        return angle
+
+    def test_moving_is_plain_integration(self):
+        """Wheels turning: nothing held, nothing learned."""
+        angle = self.run_for(2.0, 45.0, 0.0)
+        self.assertAlmostEqual(angle, 90.0, places=6)
+        self.assertEqual(self.zr.bias, 0.0)
+
+    def test_still_holds_and_learns_the_bias(self):
+        tau = self.config.standstill.bias_tau_s
+        angle = self.run_for(5 * tau, -0.01, 1.0)
+        self.assertAlmostEqual(angle, 0.0, places=9)
+        self.assertAlmostEqual(self.zr.bias, -0.01, delta=0.0002)
+
+    def test_learned_bias_is_removed_while_moving(self):
+        tau = self.config.standstill.bias_tau_s
+        self.run_for(5 * tau, -0.01, 1.0)        # parked: learns -0.01
+        drift = self.run_for(60.0, -0.01, 0.0)   # driving straight
+        self.assertAlmostEqual(drift, 0.0, delta=0.02)
+
+    def test_learned_bias_not_applied_when_disabled(self):
+        config = RobotConfig(standstill=StandstillConfig(
+            apply_learned_bias=False))
+        zr = ZeroRateFilter(config)
+        zr.bias = 0.5
+        self.assertEqual(zr.step(10.0, 0.02, 0.0), 10.0)
+
+    def test_a_knock_cannot_drag_the_bias(self):
+        lim = self.config.standstill.max_innovation_dps
+        self.zr.step(200.0, 0.02, 1.0)
+        self.assertLessEqual(abs(self.zr.bias), lim)
+
+    def test_reset_forgets(self):
+        self.zr.bias = 0.3
+        self.zr.reset()
+        self.assertEqual(self.zr.bias, 0.0)
 
 
 if __name__ == "__main__":

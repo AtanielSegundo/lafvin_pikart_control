@@ -220,8 +220,9 @@ def run(ipc: ipc_mod.IPC, config=CONFIG) -> None:
         # -- standstill detector ---------------------------------------------
         # Built BEFORE the gyro, because the gyro takes its predicate as a
         # constructor argument and starts its integration thread immediately.
-        from standstill import StandstillDetector
+        from standstill import StandstillDetector, ZeroRateFilter
         standstill = StandstillDetector(config)
+        zero_rate = ZeroRateFilter(config)
         # Seed it from the current totals so the gyro's first integration steps
         # see "moving" (the default) rather than a bogus standstill derived from
         # a baseline that does not exist yet.
@@ -238,7 +239,9 @@ def run(ipc: ipc_mod.IPC, config=CONFIG) -> None:
             # been provably quiet -- which is what stops a parked kart from
             # integrating its residual bias into phantom rotation.
             gyro = GyroMPU(sample_rate=50.0,
-                           fn_to_check_kart_movement=standstill.is_moving)
+                           fn_to_check_kart_movement=standstill.is_moving,
+                           zero_rate=zero_rate,
+                           fn_stillness=standstill.stillness)
             if gyro.is_connected():
                 ipc.log("sensors", "calibrating gyro bias -- keep the kart STILL")
                 gyro.calibrate()
@@ -284,7 +287,8 @@ def run(ipc: ipc_mod.IPC, config=CONFIG) -> None:
         except Exception as exc:                                # noqa: BLE001
             ipc.log("sensors", f"line sensors unavailable ({exc})")
 
-        _publish_loop(ipc, config, encoders, gyro, line, standstill)
+        _publish_loop(ipc, config, encoders, gyro, line, standstill,
+                      zero_rate)
 
     except Exception as exc:                                    # noqa: BLE001
         import traceback
@@ -314,7 +318,7 @@ def run(ipc: ipc_mod.IPC, config=CONFIG) -> None:
 
 
 def _publish_loop(ipc: ipc_mod.IPC, config, encoders, gyro, line,
-                  standstill=None) -> None:
+                  standstill=None, zero_rate=None) -> None:
     p = config.process
     period = 1.0 / max(1.0, p.sensor_publish_hz)
     line_every = max(1, int(round(p.sensor_publish_hz /
@@ -377,7 +381,10 @@ def _publish_loop(ipc: ipc_mod.IPC, config, encoders, gyro, line,
 
         if standstill is not None:
             try:
-                ipc.publish_standstill(standstill.telemetry())
+                state = standstill.telemetry()
+                if zero_rate is not None:
+                    state["learned_bias_dps"] = zero_rate.bias
+                ipc.publish_standstill(state)
             except Exception:                                   # noqa: BLE001
                 pass
 

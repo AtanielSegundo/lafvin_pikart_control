@@ -130,6 +130,20 @@ class StandstillDetector:
         block that thread on anything."""
         return self._moving
 
+    def stillness(self) -> float:
+        """0 while moving; once frozen, ramps to 1 over ``still_ramp_s``.
+
+        The weight ZeroRateFilter scales its freeze and its bias learning by,
+        so the filter fades in after the wheels stop and drops out on the
+        first count (``_moving`` flips back at once, see :meth:`update`)."""
+        if self._moving:
+            return 0.0
+        cfg = self.config.standstill
+        quiet_for = self._clock() - self._last_motion_ts - cfg.enter_quiet_s
+        if cfg.still_ramp_s <= 0.0:
+            return 1.0
+        return min(1.0, max(0.0, quiet_for / cfg.still_ramp_s))
+
     def _set_moving(self, moving: bool, now: float) -> bool:
         if moving != self._moving:
             if moving:
@@ -152,9 +166,51 @@ class StandstillDetector:
             "frozen_events": self.froze_count,
             "frozen_s": round(frozen, 2),
             "quiet_s": round(max(0.0, now - self._last_motion_ts), 2),
+            "stillness": round(self.stillness(), 3),
         }
 
     @staticmethod
     def blank_telemetry() -> dict:
         return {"moving": True, "frozen_events": 0, "frozen_s": 0.0,
-                "quiet_s": 0.0}
+                "quiet_s": 0.0, "stillness": 0.0}
+
+
+class ZeroRateFilter:
+    """Zero-rate update for the yaw gyro, driven by :meth:`StandstillDetector.
+    stillness`.
+
+    With the wheels still the true yaw rate is zero, so the calibrated rate the
+    gyro reports is the bias error plus noise. Two things follow, both scaled
+    by the stillness weight ``w``:
+
+      * the bias error is learned:  bias += w * dt/bias_tau_s * (rate - bias)
+      * the integration is held:    integrated rate = (1 - w) * (rate - bias)
+
+    At ``w == 0`` (wheels turning) nothing is held and nothing is learned; the
+    rate passes through, minus the learned bias if ``apply_learned_bias``.
+    That is only the start-up calibration kept current, so a turn is
+    integrated exactly as before.
+
+    Pure and hardware-free, like the detector: GyroMPU calls :meth:`step` on
+    every integration step with the bias-corrected rate in deg/s.
+    """
+
+    def __init__(self, config: RobotConfig = CONFIG):
+        self.config = config
+        self.bias = 0.0          # learned on top of the calibrated bias, deg/s
+
+    def step(self, rate_dps: float, dt: float, stillness: float) -> float:
+        """The rate to integrate for this step."""
+        cfg = self.config.standstill
+        if stillness <= 0.0:
+            return rate_dps - self.bias if cfg.apply_learned_bias else rate_dps
+        innov = rate_dps - self.bias
+        lim = cfg.max_innovation_dps
+        innov = max(-lim, min(lim, innov))
+        gain = min(1.0, dt / cfg.bias_tau_s) if cfg.bias_tau_s > 0 else 0.0
+        self.bias += stillness * gain * innov
+        return (1.0 - stillness) * (rate_dps - self.bias)
+
+    def reset(self) -> None:
+        """Forget the learned bias (a fresh calibration replaces it)."""
+        self.bias = 0.0
