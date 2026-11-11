@@ -269,6 +269,79 @@ SINGLE_PHASE_ENCODERS: Dict[str, dict] = {
     "M3": {"direction_from": "M4", "scale": 2.0},
 }
 
+# ---------------------------------------------------------------------------
+# Ultrasonic sonars (HC-SR04), all read by ultrasonic_pigpio.UltrasonicPigpio
+# on P_sensors' pigpio connection.
+#   tag -> (trigger_gpio, echo_gpio, bearing_deg)       BCM pin numbering
+# bearing: 0 = straight ahead, +90 = left, -90 = right (CCW positive, the same
+# sign as yaw). Only "front" feeds the collision guard; the side pair is
+# published for telemetry / the UI.
+#
+# Why these GPIOs are free on this build (Pi 3B+):
+#   27/22 (phys 13/15)  plain GPIO.
+#   12 (phys 32)        PWM0 -- free without a pwm/audio-remap dtoverlay. It is
+#                       also M3's phase B in ENCODER_PINS, but M3 is decoded
+#                       single-phase (phase A only, see above), so nothing
+#                       claims it in software, and the phase-B wire is NOT
+#                       connected to pin 32 (checked 2026-11-11). Keep it that
+#                       way: an encoder output and the trigger output on one
+#                       line would short each other.
+#   11 (phys 23)        SPI0 SCLK -- free because SPI0 is already off for M4
+#                       (GPIO 7/8, `dtparam=spi=on` commented out).
+#   21/16 (phys 40/36)  SPI1 SCLK / CE2, and 21 is also I2S DOUT -- free while
+#                       no spi1-* or I2S audio dtoverlay is enabled.
+# The HC-SR04 ECHO line is 5 V and the Pi's inputs are NOT 5 V tolerant: each
+# echo needs a divider (e.g. 1k / 2k) unless the module is a 3.3 V HC-SR04P.
+# ---------------------------------------------------------------------------
+SONAR_PINS: Dict[str, Tuple[int, int, float]] = {
+    "front": (27, 22,   0.0),
+    "left":  (12, 11,  90.0),     # ESQUERDA
+    "right": (21, 16, -90.0),     # DIREITA
+}
+
+# Fixed slot order for the side sonars in shared memory (Server/ipc.py) -- the
+# same reason as ENCODER_TAGS. "front" has its own block with the guard state.
+SIDE_SONAR_TAGS: Tuple[str, ...] = ("left", "right")
+
+# GPIOs owned by something other than the encoders and sonars, for the overlap
+# check below. Kept here rather than imported because those modules pull in
+# RPi.GPIO at import time.
+RESERVED_GPIO: Dict[int, str] = {
+    2: "I2C1 SDA (MPU6050, PCA9685, ADC)",
+    3: "I2C1 SCL (MPU6050, PCA9685, ADC)",
+    14: "line sensor IR01 (Line_Tracking.py)",
+    15: "line sensor IR02 (Line_Tracking.py)",
+    23: "line sensor IR03 (Line_Tracking.py)",
+    17: "buzzer (Buzzer.py)",
+}
+
+
+def gpio_owners() -> Dict[int, list]:
+    """GPIO -> every user claiming it. A pin with two owners is a wiring or
+    config mistake: two drivers on one line fight electrically."""
+    owners: Dict[int, list] = {}
+    for gpio, what in RESERVED_GPIO.items():
+        owners.setdefault(gpio, []).append(what)
+    for tag, (a, b) in ENCODER_PINS.items():
+        owners.setdefault(a, []).append(f"encoder {tag} phase A")
+        if tag not in SINGLE_PHASE_ENCODERS:       # phase B left unclaimed
+            owners.setdefault(b, []).append(f"encoder {tag} phase B")
+    for tag, (trig, echo, _bearing) in SONAR_PINS.items():
+        owners.setdefault(trig, []).append(f"sonar {tag} trigger")
+        owners.setdefault(echo, []).append(f"sonar {tag} echo")
+    return owners
+
+
+def gpio_conflicts() -> Dict[int, list]:
+    return {g: who for g, who in gpio_owners().items() if len(who) > 1}
+
+
+# Fail at import rather than at runtime: every process imports this module, and
+# a pin claimed twice would otherwise show up as a dead sensor or a miscount.
+if gpio_conflicts():
+    raise ValueError("GPIO claimed twice: " + "; ".join(
+        f"GPIO{g}: {', '.join(who)}" for g, who in sorted(gpio_conflicts().items())))
+
 # Which motor tags belong to which side, and the sign of their counts so that
 # "forward" produces positive counts on both sides.
 #

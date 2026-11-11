@@ -39,13 +39,78 @@ import sys
 import threading
 import time
 
-from config import CONFIG, ENCODER_TAGS
+from config import CONFIG, ENCODER_TAGS, SIDE_SONAR_TAGS, SONAR_PINS
 import ipc as ipc_mod
 
 # The commands this process accepts -- see proc_aux.HANDLED for why this is data.
 HANDLED = frozenset({
     "calibrate_imu", "reset_encoder_totals",
 })
+
+SONAR_PING_S = 0.06     # UltrasonicPigpio's default ping interval
+
+
+# ---------------------------------------------------------------------------
+# Side sonars (left / right): distance only, no guard
+# ---------------------------------------------------------------------------
+class SideSonarMonitor:
+    """Polls the side sonars and publishes their distances.
+
+    Same validity rule and report expiry as FrontGuardMonitor, without the
+    guard: the side pair only feeds telemetry. UltrasonicPigpio.get_distance
+    is non-blocking (pigpiod times the echo), so one thread serves both.
+    """
+
+    def __init__(self, sensors: dict, ipc: ipc_mod.IPC, config=CONFIG):
+        self.sensors = sensors                 # tag -> UltrasonicPigpio
+        self.ipc = ipc
+        self.config = config
+        self.reported = {tag: None for tag in sensors}
+        self.reported_ts = {tag: 0.0 for tag in sensors}
+        self._thread = None
+        self._stop = threading.Event()
+
+    def poll_once(self) -> None:
+        now = time.monotonic()
+        readings = {}
+        for tag, sensor in self.sensors.items():
+            try:
+                raw = sensor.get_distance()
+            except Exception as exc:                            # noqa: BLE001
+                self.ipc.log("sensors", f"{tag} sonar read failed: {exc}")
+                raw = None
+            if raw is not None and raw > 0:
+                self.reported[tag] = raw
+                self.reported_ts[tag] = now
+            elif (self.reported[tag] is not None and
+                  (now - self.reported_ts[tag]) >
+                  self.config.control.front_distance_ttl_s):
+                self.reported[tag] = None
+            readings[tag] = (self.reported[tag],
+                             getattr(sensor, "healthy", True))
+        self.ipc.publish_sonars(readings)
+
+    def _run(self) -> None:
+        period = 1.0 / (2 * self.config.control.loop_hz)
+        while not self._stop.is_set():
+            start = time.monotonic()
+            self.poll_once()
+            self._stop.wait(max(0.0, period - (time.monotonic() - start)))
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="SideSonars")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=1.0)
+        for sensor in self.sensors.values():
+            try:
+                sensor.stop()
+            except Exception:                                   # noqa: BLE001
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +259,7 @@ def run(ipc: ipc_mod.IPC, config=CONFIG) -> None:
     encoders    = None
     gyro        = None
     guard       = None
+    sonars      = None
     adc_monitor = None
     line        = None
 
@@ -254,10 +320,15 @@ def run(ipc: ipc_mod.IPC, config=CONFIG) -> None:
             gyro = None
 
         # -- ultrasonic + front guard ----------------------------------------
+        # The three sonars ping staggered across one ping interval (front,
+        # left, right) so none hears another's echo as its own.
         sensor = None
         try:
             from ultrasonic_pigpio import UltrasonicPigpio
-            sensor = UltrasonicPigpio(pi=pi)
+            trig, echo, _ = SONAR_PINS["front"]
+            sensor = UltrasonicPigpio(trigger=trig, echo=echo, pi=pi,
+                                      ping_interval=SONAR_PING_S,
+                                      name="front")
             ipc.log("sensors", "ultrasonic using pigpio (hardware-timed echo)")
         except Exception as exc:                                # noqa: BLE001
             ipc.log("sensors", f"ultrasonic pigpio unavailable ({exc}); "
@@ -271,6 +342,25 @@ def run(ipc: ipc_mod.IPC, config=CONFIG) -> None:
         if sensor is not None:
             guard = FrontGuardMonitor(sensor, ipc, config)
             guard.start()
+
+        # -- side sonars (telemetry only) ------------------------------------
+        # pigpio only: the RPi.GPIO fallback blocks per reading and claims the
+        # pins through a second library, so without pigpiod there are none.
+        side = {}
+        for i, tag in enumerate(SIDE_SONAR_TAGS, start=1):
+            trig, echo, _ = SONAR_PINS[tag]
+            try:
+                from ultrasonic_pigpio import UltrasonicPigpio
+                side[tag] = UltrasonicPigpio(
+                    trigger=trig, echo=echo, pi=pi, name=tag,
+                    ping_interval=SONAR_PING_S,
+                    start_delay=SONAR_PING_S * i / (len(SIDE_SONAR_TAGS) + 1))
+            except Exception as exc:                            # noqa: BLE001
+                ipc.log("sensors", f"{tag} sonar unavailable ({exc})")
+        if side:
+            sonars = SideSonarMonitor(side, ipc, config)
+            sonars.start()
+            ipc.log("sensors", f"side sonars: {', '.join(side)}")
 
         # -- ADC -------------------------------------------------------------
         try:
@@ -297,6 +387,8 @@ def run(ipc: ipc_mod.IPC, config=CONFIG) -> None:
     finally:
         if guard is not None:
             guard.stop()
+        if sonars is not None:
+            sonars.stop()
         if adc_monitor is not None:
             adc_monitor.stop()
         if gyro is not None:

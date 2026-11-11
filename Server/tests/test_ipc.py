@@ -366,6 +366,76 @@ class _FakeSensor:
         return self.readings.pop(0) if self.readings else 300
 
 
+class TestSideSonars(unittest.TestCase):
+    """Left/right sonars: P_sensors -> shared memory -> telemetry."""
+
+    def test_nothing_before_the_first_publish(self):
+        self.assertIsNone(_ipc().read_sonars())
+
+    def test_round_trip(self):
+        bundle = _ipc()
+        bundle.publish_sonars({"left": (42.0, True), "right": (None, False)})
+        out = bundle.read_sonars()
+        self.assertEqual(out["left"], {"cm": 42.0, "healthy": True})
+        self.assertEqual(out["right"], {"cm": None, "healthy": False})
+        self.assertGreaterEqual(out["age"], 0.0)
+
+    def test_monitor_publishes_both_sides(self):
+        import proc_sensors
+        bundle = _ipc()
+        mon = proc_sensors.SideSonarMonitor(
+            {"left": _FakeSensor([25]), "right": _FakeSensor([180])},
+            bundle, CONFIG)
+        mon.poll_once()
+        out = bundle.read_sonars()
+        self.assertEqual(out["left"]["cm"], 25.0)
+        self.assertEqual(out["right"]["cm"], 180.0)
+
+    def test_monitor_drops_a_stale_reading(self):
+        import proc_sensors
+        bundle = _ipc()
+        sensor = _FakeSensor([25])
+        mon = proc_sensors.SideSonarMonitor({"left": sensor}, bundle, CONFIG)
+        mon.poll_once()
+        sensor.get_distance = lambda: None              # stops answering
+        mon.reported_ts["left"] -= CONFIG.control.front_distance_ttl_s + 1.0
+        mon.poll_once()
+        self.assertIsNone(bundle.read_sonars()["left"]["cm"])
+
+
+class TestGpioAssignment(unittest.TestCase):
+    def test_no_pin_is_claimed_twice(self):
+        import config
+        self.assertEqual(config.gpio_conflicts(), {})
+
+    def test_every_sonar_is_configured(self):
+        import config
+        self.assertEqual(set(config.SONAR_PINS),
+                         {"front", *config.SIDE_SONAR_TAGS})
+
+    def test_a_sonar_on_an_encoder_pin_is_caught(self):
+        import config
+        saved = dict(config.SONAR_PINS)
+        try:
+            config.SONAR_PINS["left"] = (config.ENCODER_PINS["M1"][0], 11, 90.0)
+            self.assertIn(config.ENCODER_PINS["M1"][0], config.gpio_conflicts())
+        finally:
+            config.SONAR_PINS.clear()
+            config.SONAR_PINS.update(saved)
+
+    def test_m3_phase_b_is_free_only_while_single_phase(self):
+        """GPIO12 is shared with M3's unused phase B -- legal only because M3
+        is decoded on phase A alone."""
+        import config
+        self.assertIn("M3", config.SINGLE_PHASE_ENCODERS)
+        saved = dict(config.SINGLE_PHASE_ENCODERS)
+        try:
+            config.SINGLE_PHASE_ENCODERS.clear()
+            self.assertIn(12, config.gpio_conflicts())
+        finally:
+            config.SINGLE_PHASE_ENCODERS.update(saved)
+
+
 class TestFrontGuardMonitor(unittest.TestCase):
     """The hysteresis and TTL lifted out of DriveController._dist_guard."""
 

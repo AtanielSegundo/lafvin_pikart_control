@@ -30,7 +30,7 @@ import threading
 import time
 
 from Command import COMMAND as cmd
-from config import CONFIG
+from config import CONFIG, SIDE_SONAR_TAGS
 import ipc as ipc_mod
 from protocol import Command, CommandRouter
 from supervisor import Supervisor
@@ -419,6 +419,16 @@ class Server:
         # totals (Scripts/motor_calibration.py) need the real sample time.
         drive['control_ts'] = control_ts
 
+        # All three sonars in one place for a client. "front" repeats the
+        # guard's reading (drive.front_distance_cm is what P_control acted on);
+        # the side pair is published only here.
+        front_cm, front_guard, front_ok, _ = self.ipc.read_distance()
+        sides = self.ipc.read_sonars() or {}
+        sonar = {"front": {"cm": front_cm, "healthy": front_ok,
+                           "guard": front_guard}}
+        for tag in SIDE_SONAR_TAGS:
+            sonar[tag] = sides.get(tag, {"cm": None, "healthy": False})
+
         return {
             "battery": round(battery, 2),
             "mode": self.Mode,
@@ -428,6 +438,7 @@ class Server:
             "servo": servo,
             "light": {"left": light_l, "right": light_r},
             "line": self.ipc.read_line(),
+            "sonar": sonar,
             "standstill": self.ipc.read_standstill(),
             "processes": self.supervisor.status(),
         }

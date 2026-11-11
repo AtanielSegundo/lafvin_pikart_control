@@ -51,7 +51,7 @@ import sys
 import time
 from typing import Dict, Iterable, Optional, Sequence
 
-from config import CONFIG, ENCODER_TAGS, RobotConfig
+from config import CONFIG, ENCODER_TAGS, SIDE_SONAR_TAGS, RobotConfig
 
 # Shared-array layouts. Index constants beat magic numbers here because two
 # processes have to agree on them.
@@ -59,6 +59,9 @@ ENC_TS = len(ENCODER_TAGS)          # encoder array: N totals then a timestamp
 
 GYRO_YAW, GYRO_SAMPLE_TS, GYRO_CONNECTED, GYRO_TS = 0, 1, 2, 3
 DIST_CM, DIST_GUARD, DIST_HEALTHY, DIST_TS = 0, 1, 2, 3
+# Side sonars: (cm, healthy) per SIDE_SONAR_TAGS slot, then one timestamp.
+SONAR_CM, SONAR_HEALTHY, SONAR_STRIDE = 0, 1, 2
+SONAR_TS = SONAR_STRIDE * len(SIDE_SONAR_TAGS)
 ADC_BATTERY, ADC_LIGHT_L, ADC_LIGHT_R, ADC_TS = 0, 1, 2, 3
 LINE_L, LINE_M, LINE_R, LINE_VALID = 0, 1, 2, 3
 STILL_MOVING, STILL_EVENTS, STILL_FROZEN_S, STILL_TS = 0, 1, 2, 3
@@ -390,6 +393,7 @@ class IPC:
         self.enc = ctx.Array("q", len(ENCODER_TAGS) + 1)
         self.gyro = ctx.Array("d", 4)
         self.dist = ctx.Array("d", 4)
+        self.sonar = ctx.Array("d", SONAR_TS + 1)
         self.adc = ctx.Array("d", 4)
         self.line = ctx.Array("i", 4)
         self.standstill = ctx.Array("d", 6)
@@ -399,6 +403,10 @@ class IPC:
         with self.dist:
             self.dist[DIST_CM] = _NAN
             self.dist[DIST_HEALTHY] = 1.0
+        with self.sonar:
+            for i in range(len(SIDE_SONAR_TAGS)):
+                self.sonar[i * SONAR_STRIDE + SONAR_CM] = _NAN
+                self.sonar[i * SONAR_STRIDE + SONAR_HEALTHY] = 1.0
         with self.gyro:
             self.gyro[GYRO_YAW] = 0.0
         with self.standstill:
@@ -452,6 +460,19 @@ class IPC:
             self.dist[DIST_GUARD] = 1.0 if guard else 0.0
             self.dist[DIST_HEALTHY] = 1.0 if healthy else 0.0
             self.dist[DIST_TS] = time.monotonic()
+
+    def publish_sonars(self, readings: dict) -> None:
+        """Side sonars: {tag: (cm or None, healthy)}. Telemetry only -- the
+        collision guard is the front sonar's, in publish_distance."""
+        with self.sonar:
+            for i, tag in enumerate(SIDE_SONAR_TAGS):
+                if tag not in readings:
+                    continue
+                cm, healthy = readings[tag]
+                base = i * SONAR_STRIDE
+                self.sonar[base + SONAR_CM] = _NAN if cm is None else float(cm)
+                self.sonar[base + SONAR_HEALTHY] = 1.0 if healthy else 0.0
+            self.sonar[SONAR_TS] = time.monotonic()
 
     def publish_adc(self, battery: float, light_l: float, light_r: float) -> None:
         with self.adc:
@@ -521,6 +542,21 @@ class IPC:
                     self.dist[DIST_GUARD] >= 0.5,
                     self.dist[DIST_HEALTHY] >= 0.5,
                     self.dist[DIST_TS])
+
+    def read_sonars(self):
+        """{tag: {"cm", "healthy"}, "age": s}, or None before the first
+        publish."""
+        with self.sonar:
+            if self.sonar[SONAR_TS] == 0.0:
+                return None
+            out = {}
+            for i, tag in enumerate(SIDE_SONAR_TAGS):
+                base = i * SONAR_STRIDE
+                cm = self.sonar[base + SONAR_CM]
+                out[tag] = {"cm": None if cm != cm else round(cm, 1),   # NaN
+                            "healthy": self.sonar[base + SONAR_HEALTHY] >= 0.5}
+            out["age"] = round(time.monotonic() - self.sonar[SONAR_TS], 2)
+            return out
 
     def read_adc(self):
         with self.adc:

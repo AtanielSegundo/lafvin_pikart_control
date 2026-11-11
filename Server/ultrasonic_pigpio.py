@@ -23,7 +23,10 @@ except ImportError:
 _CM_PER_US = 0.0343 / 2.0
 
 class UltrasonicPigpio:
-    def __init__(self, trigger=27, echo=22, pi=None,
+    def __init__(self, 
+                 trigger=27, 
+                 echo=22, 
+                 pi=None,
                  max_distance_cm = 300,
                  ping_interval   = 0.06,
                  stale_after     = 0.2,
@@ -31,7 +34,12 @@ class UltrasonicPigpio:
                  # (no rising edge, or a rise with no fall) before the next
                  # trigger. max consecutive failures before the sensor is
                  # latched faulted -- 4096 * ping_interval ~= 246 s.
-                 max_ping_tries_before_halt = 4096
+                 max_ping_tries_before_halt = 4096,
+                 name            = "ultrasonic",
+                 # Delay before the first ping. With several sonars on one
+                 # kart, staggering them across ping_interval keeps one from
+                 # hearing another's echo as its own.
+                 start_delay     = 0.0
                  ):
         if not _PIGPIO_AVAILABLE:
             raise RuntimeError("pigpio not installed")
@@ -42,6 +50,8 @@ class UltrasonicPigpio:
         self.ping_interval   = ping_interval    # s between trigger pulses
         self.stale_after     = stale_after      # s; no echo => report far
         self.max_ping_tries  = max_ping_tries_before_halt
+        self.name            = name
+        self.start_delay     = max(0.0, float(start_delay))
         
         self._pi = pi
         self._owns_pi = pi is None
@@ -68,7 +78,7 @@ class UltrasonicPigpio:
 
         self._running = True
         self._t = threading.Thread(target=self._ping_loop, daemon=True,
-                                   name="UltrasonicPing")
+                                   name=f"UltrasonicPing-{name}")
         self._t.start()
         time.sleep(0.05)                            # let a first echo land
 
@@ -101,12 +111,12 @@ class UltrasonicPigpio:
             self._tries_count = 0
             if self._faulted:
                 self._faulted = False
-                print("[ultrasonic] echo recovered -- sensor healthy again")
+                print(f"[{self.name}] echo recovered -- sensor healthy again")
         else:
             self._tries_count += 1
             if self._tries_count >= self.max_ping_tries and not self._faulted:
                 self._faulted = True
-                print(f"[ultrasonic] no echo for {self._tries_count} consecutive "
+                print(f"[{self.name}] no echo for {self._tries_count} consecutive "
                       f"pings -- sensor faulted")
 
         # Drop any incomplete pulse: a stale rise tick paired with a later
@@ -115,6 +125,8 @@ class UltrasonicPigpio:
         self._rise_tick = None
 
     def _ping_loop(self):
+        if self.start_delay:
+            time.sleep(self.start_delay)
         while self._running:
             self._last_ping_try_check()
             try:

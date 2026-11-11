@@ -193,7 +193,10 @@ canvas.joystick {
     <div>vL: <span id="odoVL" style="color:#4cc9f0;">0.00</span></div>
     <div>vR: <span id="odoVR" style="color:#4cc9f0;">0.00</span></div>
     <div>ctl: <span id="odoEng" style="color:#4cc9f0;">raw</span></div>
-    <div>dist: <span id="odoDist" style="color:#4cc9f0;">-- cm</span></div>
+    <!-- Sonars, laid out as they sit on the kart: left (+90°), front, right (-90°) -->
+    <div>◀ L: <span id="sonarL" style="color:#4cc9f0;">-- cm</span></div>
+    <div>▲ F: <span id="odoDist" style="color:#4cc9f0;">-- cm</span></div>
+    <div>R ▶: <span id="sonarR" style="color:#4cc9f0;">-- cm</span></div>
     <div>guard: <span id="odoGuard" style="color:#4cc9f0;">off</span></div>
   </div>
 </div>
@@ -345,8 +348,25 @@ function handleTelemetry(raw) {
   setTxt('odoVR', (ws_.right ?? 0).toFixed(2));
   setTxt('odoEng', d.engaged ? 'PID' : 'raw');
 
-  // Front ultrasonic distance + collision-guard state (live debug readout).
-  setTxt('odoDist', d.front_distance_cm == null ? '-- cm' : d.front_distance_cm + ' cm');
+  // Sonars: front (also the collision guard's input), left, right. Coloured by
+  // range; "fault" once a sensor has stopped answering pings.
+  const sonar = msg.sonar || {};
+  const showSonar = (id, s, fallbackCm) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const cm = s && s.cm != null ? s.cm : fallbackCm;
+    if (s && s.healthy === false) {
+      el.textContent = 'fault';
+      el.style.color = '#888';
+      return;
+    }
+    el.textContent = cm == null ? '-- cm' : Math.round(cm) + ' cm';
+    el.style.color = cm == null ? '#4cc9f0'
+                   : cm < 15 ? '#e63946' : cm < 40 ? '#f4a261' : '#4cc9f0';
+  };
+  showSonar('odoDist', sonar.front, d.front_distance_cm);
+  showSonar('sonarL', sonar.left, null);
+  showSonar('sonarR', sonar.right, null);
   const guardEl = document.getElementById('odoGuard');
   if (guardEl) {
     guardEl.textContent = d.guard_blocked ? 'BLOCK' : 'off';
