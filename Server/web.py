@@ -161,13 +161,12 @@ async def telemetry_broadcaster(app):
         if not clients:
             continue
         tel = srv.get_telemetry()
+        # Everything get_telemetry() returns goes out. A hand-kept list of
+        # keys here silently dropped every block added later (the sonars).
         message = protocol.telemetry_message(
             battery=tel['battery'], mode=tel['mode'], drive=tel['drive'],
-            extra={'signs': tel.get('signs'), 'servo': tel.get('servo'),
-                   'gains': tel.get('gains'),
-                   'light': tel.get('light'), 'line': tel.get('line'),
-                   'standstill': tel.get('standstill'),
-                   'processes': tel.get('processes')})
+            extra={k: v for k, v in tel.items()
+                   if k not in ('battery', 'mode', 'drive')})
         for ws in list(clients):
             if ws.closed:
                 clients.discard(ws)
